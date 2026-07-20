@@ -1048,13 +1048,10 @@ svg {
 }
 
 .chat-pane.terminal-mode {
-  grid-template-rows: 68px 30px minmax(180px, 1fr);
+  grid-template-rows: 68px 30px minmax(160px, 1fr) 4px 72px 36px;
 }
 
-.terminal-mode .composer-splitter,
-.terminal-mode .format-toolbar,
-.terminal-mode .composer-area,
-.terminal-mode .send-row {
+.terminal-mode .format-toolbar {
   display: none;
 }
 
@@ -1201,15 +1198,17 @@ svg {
 
 .terminal-mode .composer-area {
   border-color: var(--input-border);
-  background: #ffffff;
+  background: var(--paper);
   box-shadow: inset 1px 1px #c7c7c7;
 }
 
 .terminal-mode .composer-area textarea {
   color: #1d2428;
-  background: #ffffff;
+  background: var(--paper);
   caret-color: var(--title-blue);
-  font-family: var(--mono-font);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 20px;
 }
 
 .terminal-mode .composer-area textarea::placeholder {
@@ -1679,6 +1678,10 @@ svg {
 
   .chat-pane {
     grid-template-rows: 58px 30px minmax(130px, 1fr) 4px 28px 68px 34px;
+  }
+
+  .chat-pane.terminal-mode {
+    grid-template-rows: 58px 30px minmax(120px, 1fr) 4px 58px 34px;
   }
 
   .chat-contact-header {

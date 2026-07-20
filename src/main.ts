@@ -146,11 +146,14 @@ let terminalResizeTimer: number | null = null;
 let terminalLineBuffer = "";
 let terminalExitNotice = "";
 let terminalGeneration = 0;
+let messageInputComposing = false;
+let messageCompositionResetTimer: number | null = null;
 let lastWindowMaximized: boolean | null = null;
 let windowStateSyncScheduled = false;
 const terminalDisposables: IDisposable[] = [];
 const collapsedGroups = new Set<string>();
 const pendingReplies = new Set<string>();
+const messageDrafts = new Map<string, string>();
 
 function icon(name: keyof typeof iconSet, size = 16): string {
   return `<i data-lucide="${name}" data-size="${size}" aria-hidden="true"></i>`;
@@ -254,7 +257,7 @@ appRoot.innerHTML = `
 
         <div class="transcript-frame">
           <div class="transcript" id="transcript" tabindex="0" aria-label="聊天记录"></div>
-          <div class="terminal-host" id="terminal-host" aria-label="本机终端" hidden></div>
+          <div class="terminal-host" id="terminal-host" lang="zh-CN" aria-label="本机终端" hidden></div>
         </div>
 
         <div class="composer-splitter" aria-hidden="true"></div>
@@ -273,7 +276,7 @@ appRoot.innerHTML = `
         </div>
 
         <div class="composer-area">
-          <textarea id="message-input" maxlength="2000" aria-label="输入消息" placeholder=""></textarea>
+          <textarea id="message-input" maxlength="2000" lang="zh-CN" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="输入消息" placeholder=""></textarea>
         </div>
 
         <div class="send-row">
@@ -483,7 +486,7 @@ function handlePreviewTerminalInput(data: string): void {
   }
 }
 
-function ensureTerminal(): void {
+function ensureTerminal(focus = true): void {
   terminalHost.hidden = false;
   transcript.hidden = true;
   if (!terminal) {
@@ -548,7 +551,7 @@ function ensureTerminal(): void {
   }
   resizePtyToFit();
   if (isTauriRuntime()) void openTerminalSession();
-  terminal.focus();
+  if (focus) terminal.focus();
 }
 
 async function restartTerminal(): Promise<void> {
@@ -750,10 +753,12 @@ function renderChatHeader(): void {
   document.querySelectorAll<HTMLElement>(".terminal-only-control").forEach((control) => {
     control.hidden = !terminalMode;
   });
-  query(".format-hint").textContent = terminalMode ? "命令模式" : "纯文本";
-  query("#send-button span").textContent = terminalMode ? "执行" : "发送(S)";
-  messageInput.placeholder = terminalMode ? "输入命令，例如 help、pwd 或 ls" : "";
-  messageInput.setAttribute("aria-label", terminalMode ? "输入终端命令" : "输入消息");
+  query(".format-hint").textContent = terminalMode ? "UTF-8 终端输入" : "纯文本";
+  query("#send-button span").textContent = terminalMode ? "输入(T)" : "发送(S)";
+  messageInput.placeholder = terminalMode
+    ? "输入命令或中文内容，Enter 发送到终端"
+    : "";
+  messageInput.setAttribute("aria-label", terminalMode ? "终端中文输入对话框" : "输入消息");
   transcript.setAttribute("aria-label", terminalMode ? "终端输出" : "聊天记录");
   const avatar = query<HTMLImageElement>("#chat-avatar");
   avatar.src = avatarFor(contact);
@@ -852,12 +857,14 @@ function updateTypingStatus(): void {
 }
 
 function updateSendState(): void {
+  const hasText = messageInput.value.trim().length > 0;
   if (isTerminalContact()) {
-    sendButton.disabled = true;
-    query("#send-tip").textContent = "终端已连接 · 直接在上方输入";
+    sendButton.disabled = !hasText;
+    query("#send-tip").textContent = hasText
+      ? `${messageInput.value.length}/2000 · 中文输入法可用 · Enter 输入`
+      : "中文输入法可用 · Enter 输入，Shift+Enter 换行";
     return;
   }
-  const hasText = messageInput.value.trim().length > 0;
   sendButton.disabled = !hasText;
   query("#send-tip").textContent = hasText
     ? `${messageInput.value.length}/2000  ·  Enter 发送`
@@ -878,7 +885,10 @@ async function selectContact(contactId: string): Promise<void> {
     }
     return;
   }
+  messageDrafts.set(snapshot.activeContactId, messageInput.value);
   snapshot.activeContactId = contactId;
+  messageInput.value = messageDrafts.get(contactId) ?? "";
+  messageInputComposing = false;
   shell.classList.add("show-chat");
   renderContacts();
   renderChatHeader();
@@ -937,19 +947,36 @@ async function scheduleReply(contactId: string): Promise<void> {
   }
 }
 
+function terminalSubmissionBytes(value: string): Uint8Array {
+  // Match xterm's own paste normalization: a terminal Enter key is CR, not LF.
+  const normalized = value.replace(/\r\n|\r|\n/g, "\r");
+  const input = terminal?.modes.bracketedPasteMode
+    ? `\u001b[200~${normalized}\u001b[201~`
+    : normalized;
+  return new TextEncoder().encode(`${input}\r`);
+}
+
 async function sendCurrentMessage(overrideText?: string): Promise<void> {
-  const text = (overrideText ?? messageInput.value).trim();
-  if (!text) return;
   const contactId = snapshot.activeContactId;
+  const rawText = overrideText ?? messageInput.value;
+  const text = isTerminalContact(contactId) ? rawText : rawText.trim();
+  if (!text.trim()) return;
   sendButton.disabled = true;
   try {
     if (isTerminalContact(contactId)) {
-      ensureTerminal();
-      if (isTauriRuntime()) queuePtyWrite(new TextEncoder().encode(`${text}\r`));
-      else handlePreviewTerminalInput(`${text}\r`);
+      // Keep the standard textarea focused so the platform IME context stays alive.
+      ensureTerminal(false);
+      if (isTauriRuntime()) {
+        if (!terminalSessionId) await openTerminalSession();
+        if (!terminalSessionId) throw new Error("终端尚未连接，请点击重启终端");
+        queuePtyWrite(terminalSubmissionBytes(text));
+      } else {
+        handlePreviewTerminalInput(`${text}\r`);
+      }
       messageInput.value = "";
+      messageDrafts.delete(contactId);
       updateSendState();
-      terminal?.focus();
+      messageInput.focus();
       return;
     }
 
@@ -959,6 +986,7 @@ async function sendCurrentMessage(overrideText?: string): Promise<void> {
     contact.lastMessage = sent.text;
     contact.lastMessageAt = sent.sentAt;
     messageInput.value = "";
+    messageDrafts.delete(contactId);
     updateSendState();
     renderContacts();
     renderMessages(true);
@@ -1186,16 +1214,37 @@ function bindEvents(): void {
     button.addEventListener("click", () => setTab(button.dataset.tab as RosterTab));
   });
 
-  messageInput.addEventListener("input", updateSendState);
+  messageInput.addEventListener("compositionstart", () => {
+    if (messageCompositionResetTimer !== null) {
+      window.clearTimeout(messageCompositionResetTimer);
+      messageCompositionResetTimer = null;
+    }
+    messageInputComposing = true;
+  });
+  messageInput.addEventListener("compositionend", () => {
+    // Some WebViews dispatch the candidate-confirming Enter immediately after
+    // compositionend. Keep the guard for one event loop so it is not sent.
+    messageCompositionResetTimer = window.setTimeout(() => {
+      messageCompositionResetTimer = null;
+      messageInputComposing = false;
+    }, 0);
+  });
+  messageInput.addEventListener("input", () => {
+    if (snapshot?.activeContactId) {
+      messageDrafts.set(snapshot.activeContactId, messageInput.value);
+    }
+    updateSendState();
+  });
   messageInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
+      if (event.isComposing || messageInputComposing || event.keyCode === 229) return;
       event.preventDefault();
       void sendCurrentMessage();
     }
   });
   sendButton.addEventListener("click", () => void sendCurrentMessage());
   query("#send-options").addEventListener("click", (event) => {
-    const action = isTerminalContact() ? "执行" : "发送";
+    const action = isTerminalContact() ? "输入终端" : "发送";
     showPopup(event.currentTarget as HTMLElement, [
       { label: `按 Enter ${action}`, action: () => messageInput.focus() },
       { label: `按 Ctrl+Enter ${action}`, disabled: true },

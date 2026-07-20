@@ -564,6 +564,24 @@ fn run_terminal_command(command: &str, cwd: &Path) -> (String, Option<i32>, bool
     }
 }
 
+#[cfg(target_os = "linux")]
+fn configure_wslg_input_backend() {
+    if std::env::var_os("GDK_BACKEND").is_some() {
+        return;
+    }
+
+    let is_wsl = std::env::var_os("WSL_INTEROP").is_some()
+        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|release| release.to_ascii_lowercase().contains("microsoft"))
+            .unwrap_or(false);
+    if is_wsl {
+        // WSLg does not yet expose the native Wayland input-method protocol to
+        // desktop apps. GTK's X11 backend lets the user's Fcitx/IBus GTK module
+        // handle composition, while still respecting an explicit user choice.
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+}
+
 fn truncate_terminal_output(value: String) -> String {
     let mut characters = value.chars();
     let mut output: String = characters
@@ -902,7 +920,31 @@ fn set_presence(presence: String, state: State<'_, ManagedChatState>) -> Result<
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    configure_wslg_input_backend();
+
     tauri::Builder::default()
+        .setup(|app| {
+            #[cfg(target_os = "linux")]
+            {
+                use tauri::Manager;
+                use webkit2gtk::{InputMethodContextExt, WebViewExt};
+
+                // Wry 0.55 disables WebKitGTK preedit by default. Re-enable it
+                // so Fcitx/IBus can deliver proper DOM composition events and
+                // render an in-place candidate string in input/textarea fields.
+                if let Some(main_webview) = app.get_webview_window("main") {
+                    main_webview.with_webview(|platform_webview| {
+                        if let Some(input_context) = platform_webview.inner().input_method_context()
+                        {
+                            input_context.set_enable_preedit(true);
+                        }
+                    })?;
+                }
+            }
+
+            Ok(())
+        })
         .manage(Mutex::new(ChatStore::demo()))
         .manage(PtyState::default())
         .invoke_handler(tauri::generate_handler![
