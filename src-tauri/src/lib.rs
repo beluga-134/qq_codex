@@ -162,11 +162,11 @@ impl ChatStore {
             },
             Contact {
                 id: TERMINAL_ID.into(),
-                display_name: "终端".into(),
-                account: "LOCAL SHELL".into(),
+                display_name: "WSL 终端".into(),
+                account: "WSL SHELL".into(),
                 avatar_seed: "terminal".into(),
                 presence: "online".into(),
-                status_message: "本机命令行 · 可执行命令".into(),
+                status_message: "WSL2 默认发行版 · Linux shell".into(),
                 group: "工具".into(),
                 unread_count: 0,
                 last_message: "输入 help 查看可用命令。".into(),
@@ -251,8 +251,8 @@ impl ChatStore {
                 7,
                 TERMINAL_ID,
                 TERMINAL_ID,
-                "终端",
-                "Retro Terminal 1.0\n输入 help 查看可用命令。",
+                "WSL 终端",
+                "Retro WSL Terminal 1.0\n输入 help 查看可用 Linux 命令。",
                 now.saturating_sub(2 * 60_000),
                 false,
                 true,
@@ -344,7 +344,7 @@ impl ChatStore {
             id: self.take_message_id(),
             contact_id: TERMINAL_ID.into(),
             sender_id: TERMINAL_ID.into(),
-            sender_name: "终端".into(),
+            sender_name: "WSL 终端".into(),
             text,
             sent_at: now_ms(),
             outgoing: false,
@@ -512,29 +512,59 @@ fn terminal_working_directory() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn run_terminal_command(command: &str, cwd: &Path) -> (String, Option<i32>, bool) {
-    if matches!(command.trim().to_ascii_lowercase().as_str(), "help" | "?") {
-        return (
-            "可直接执行当前系统 shell 命令。\n常用命令：pwd  ls  whoami  date  cargo --version\n命令最长运行 20 秒，输出最多保留 12000 个字符。".into(),
-            Some(0),
-            true,
-        );
+fn terminal_help_text() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "可直接在 WSL 中执行 Linux shell 命令。\n常用命令：pwd  ls  whoami  date  cargo --version\n输出最多保留 12000 个字符。"
     }
 
-    #[cfg(target_os = "windows")]
-    let result = Command::new("cmd")
-        .args(["/D", "/S", "/C", command])
+    #[cfg(not(target_os = "windows"))]
+    {
+        "可直接执行当前系统 shell 命令。\n常用命令：pwd  ls  whoami  date  cargo --version\n命令最长运行 20 秒，输出最多保留 12000 个字符。"
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_platform_terminal_command(
+    command: &str,
+    cwd: &Path,
+) -> std::io::Result<std::process::Output> {
+    Command::new("wsl.exe")
+        .args(["--exec", "/bin/sh", "-lc", command])
         .current_dir(cwd)
         .env("NO_COLOR", "1")
-        .output();
+        .output()
+}
 
-    #[cfg(not(target_os = "windows"))]
-    let result = Command::new("timeout")
+#[cfg(not(target_os = "windows"))]
+fn run_platform_terminal_command(
+    command: &str,
+    cwd: &Path,
+) -> std::io::Result<std::process::Output> {
+    Command::new("timeout")
         .args(["20s", "bash", "-lc", command])
         .current_dir(cwd)
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
-        .output();
+        .output()
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_command_timed_out(_exit_code: Option<i32>) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminal_command_timed_out(exit_code: Option<i32>) -> bool {
+    exit_code == Some(124)
+}
+
+fn run_terminal_command(command: &str, cwd: &Path) -> (String, Option<i32>, bool) {
+    if matches!(command.trim().to_ascii_lowercase().as_str(), "help" | "?") {
+        return (terminal_help_text().into(), Some(0), true);
+    }
+
+    let result = run_platform_terminal_command(command, cwd);
 
     match result {
         Ok(output) => {
@@ -550,7 +580,7 @@ fn run_terminal_command(command: &str, cwd: &Path) -> (String, Option<i32>, bool
                 text.push_str(stderr.trim_end());
             }
             if text.is_empty() {
-                text = if exit_code == Some(124) {
+                text = if terminal_command_timed_out(exit_code) {
                     "命令超过 20 秒，已终止。".into()
                 } else if success {
                     "(命令执行完成，没有输出)".into()
@@ -560,8 +590,40 @@ fn run_terminal_command(command: &str, cwd: &Path) -> (String, Option<i32>, bool
             }
             (truncate_terminal_output(text), exit_code, success)
         }
-        Err(error) => (format!("无法启动本机 shell：{error}"), None, false),
+        Err(error) => (format!("无法启动 WSL shell：{error}"), None, false),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn pty_shell_candidates() -> Vec<(&'static str, CommandBuilder)> {
+    vec![("WSL", CommandBuilder::new("wsl.exe"))]
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pty_shell_candidates() -> Vec<(&'static str, CommandBuilder)> {
+    vec![("系统默认 shell", CommandBuilder::new_default_prog())]
+}
+
+fn configure_pty_command(command: &mut CommandBuilder) {
+    command.cwd(terminal_working_directory());
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "RetroMessenger");
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+
+    #[cfg(target_os = "windows")]
+    if let Some(path) = std::env::var_os("PATH") {
+        // portable-pty merges registry environment entries on Windows; restore
+        // the launcher's project-local Node/Cargo paths after that merge.
+        command.env("PATH", path);
+    }
+
+    // The bundled development Node setup exports this variable for npm. It
+    // makes nvm print a warning in every interactive shell and can interfere
+    // with Codex's own Node discovery, so leave the normal shell environment
+    // in charge of its prefix.
+    command.env_remove("NPM_CONFIG_PREFIX");
+    command.env_remove("npm_config_prefix");
 }
 
 #[cfg(target_os = "linux")]
@@ -729,19 +791,6 @@ fn pty_open(
         .openpty(size)
         .map_err(|error| format!("无法创建终端：{error}"))?;
 
-    let mut command = CommandBuilder::new_default_prog();
-    command.cwd(terminal_working_directory());
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
-    command.env("TERM_PROGRAM", "RetroMessenger");
-    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-    // The bundled development Node setup exports this variable for npm. It
-    // makes nvm print a warning in every interactive shell and can interfere
-    // with Codex's own Node discovery, so leave the normal shell environment
-    // in charge of its prefix.
-    command.env_remove("NPM_CONFIG_PREFIX");
-    command.env_remove("npm_config_prefix");
-
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -750,10 +799,19 @@ fn pty_open(
         .master
         .take_writer()
         .map_err(|error| format!("无法写入终端：{error}"))?;
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| format!("无法启动 shell：{error}"))?;
+    let mut spawn_errors = Vec::new();
+    let mut child = None;
+    for (shell_name, mut command) in pty_shell_candidates() {
+        configure_pty_command(&mut command);
+        match pair.slave.spawn_command(command) {
+            Ok(spawned) => {
+                child = Some(spawned);
+                break;
+            }
+            Err(error) => spawn_errors.push(format!("{shell_name}：{error}")),
+        }
+    }
+    let mut child = child.ok_or_else(|| format!("无法启动 shell：{}", spawn_errors.join("；")))?;
     let killer = child.clone_killer();
     // The slave must be dropped after spawning. Keeping it alive in the parent
     // prevents EOF from reaching the reader when the child exits.
@@ -924,7 +982,7 @@ pub fn run() {
     configure_wslg_input_backend();
 
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(|_app| {
             #[cfg(target_os = "linux")]
             {
                 use tauri::Manager;
@@ -933,7 +991,7 @@ pub fn run() {
                 // Wry 0.55 disables WebKitGTK preedit by default. Re-enable it
                 // so Fcitx/IBus can deliver proper DOM composition events and
                 // render an in-place candidate string in input/textarea fields.
-                if let Some(main_webview) = app.get_webview_window("main") {
+                if let Some(main_webview) = _app.get_webview_window("main") {
                     main_webview.with_webview(|platform_webview| {
                         if let Some(input_context) = platform_webview.inner().input_method_context()
                         {
@@ -1023,6 +1081,45 @@ mod tests {
             execution.output_message.text
         );
         assert!(store.execute_terminal(" \n ").is_err());
+    }
+
+    #[test]
+    fn terminal_help_matches_the_platform_shell() {
+        let help = terminal_help_text();
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(help.contains("WSL"));
+            assert!(help.contains("pwd"));
+            assert!(!help.contains("20 秒"));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(help.contains("pwd"));
+            assert!(help.contains("20 秒"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_wsl_terminal_command_preserves_utf8_output() {
+        let (text, exit_code, success) =
+            run_terminal_command("printf '中文输出正常\\n'", &terminal_working_directory());
+
+        assert!(success, "WSL command failed: {text}");
+        assert_eq!(exit_code, Some(0));
+        assert!(text.contains("中文输出正常"), "unexpected output: {text}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_pty_is_wsl_only() {
+        let candidates = pty_shell_candidates();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "WSL");
+        assert_eq!(candidates[0].1.get_argv()[0].to_string_lossy(), "wsl.exe");
     }
 
     #[test]

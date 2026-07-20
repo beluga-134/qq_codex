@@ -84,11 +84,11 @@ const mockContacts: Contact[] = [
   },
   {
     id: TERMINAL_CONTACT_ID,
-    displayName: "终端",
-    account: "LOCAL SHELL",
+    displayName: "WSL 终端",
+    account: "WSL SHELL",
     avatarSeed: "terminal",
     presence: "online",
-    statusMessage: "本机命令行 · 可执行命令",
+    statusMessage: "WSL2 默认发行版 · Linux shell",
     group: "工具",
     unreadCount: 0,
     lastMessage: "输入 help 查看可用命令。",
@@ -192,8 +192,8 @@ const mockMessages = new Map<string, Message[]>([
         id: 7,
         contactId: TERMINAL_CONTACT_ID,
         senderId: TERMINAL_CONTACT_ID,
-        senderName: "终端",
-        text: "Retro Terminal 1.0\n输入 help 查看可用命令。",
+        senderName: "WSL 终端",
+        text: "Retro WSL Terminal 1.0\n输入 help 查看可用 Linux 命令。",
         sentAt: now - 2 * 60_000,
         outgoing: false,
         read: true,
@@ -232,6 +232,7 @@ function mockReply(contact: Contact, lastText: string): string {
 }
 
 function mockTerminalExecution(command: string): TerminalExecution {
+  const mockProjectRoot = "/mnt/e/qq_codex/qq_codex";
   const normalized = command.trim();
   const commandMessage: Message = {
     id: mockMessageId++,
@@ -246,25 +247,25 @@ function mockTerminalExecution(command: string): TerminalExecution {
   const lower = normalized.toLocaleLowerCase();
   let output = "";
   if (lower === "help" || lower === "?") {
-    output = "可用命令：help  pwd  ls  whoami  date  echo <文字>\n桌面版可执行当前系统 shell 命令。";
+    output = "可用命令：help  pwd  ls  whoami  date  echo <文字>\n桌面版通过 wsl.exe 连接默认 Linux 发行版。";
   } else if (lower === "pwd") {
-    output = "/workspace/qq_codex";
-  } else if (lower === "ls" || lower === "dir") {
+    output = mockProjectRoot;
+  } else if (lower === "ls") {
     output = "README.md\npackage.json\nsrc\nsrc-tauri\nscripts";
   } else if (lower === "whoami") {
-    output = "retro-user";
+    output = "wsl-user";
   } else if (lower === "date") {
     output = new Date().toString();
   } else if (lower.startsWith("echo ")) {
     output = normalized.slice(5);
   } else {
-    output = "浏览器预览不会直接执行系统命令。请使用 Tauri 桌面版访问本机终端。";
+    output = "浏览器预览不会启动 wsl.exe。请使用 Tauri 桌面版访问 WSL 终端。";
   }
   const outputMessage: Message = {
     id: mockMessageId++,
     contactId: TERMINAL_CONTACT_ID,
     senderId: TERMINAL_CONTACT_ID,
-    senderName: "终端",
+    senderName: "WSL 终端",
     text: output || "(命令执行完成，没有输出)",
     sentAt: Date.now(),
     outgoing: false,
@@ -282,7 +283,7 @@ function mockTerminalExecution(command: string): TerminalExecution {
   return {
     commandMessage: clone(commandMessage),
     outputMessage: clone(outputMessage),
-    cwd: "/workspace/qq_codex",
+    cwd: mockProjectRoot,
     exitCode: 0,
     success: true,
   };

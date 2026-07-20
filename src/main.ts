@@ -264,7 +264,7 @@ appRoot.innerHTML = `
             <div class="chat-name-line">
               <strong id="chat-contact-name">正在连接...</strong>
               <span class="presence-label" id="chat-presence">[离线]</span>
-              <span class="terminal-badge" id="terminal-badge" hidden>${icon("Terminal", 12)}<span>LOCAL SHELL</span></span>
+              <span class="terminal-badge" id="terminal-badge" hidden>${icon("Terminal", 12)}<span>WSL SHELL</span></span>
             </div>
             <div class="chat-account" id="chat-account">OICQ: --</div>
             <div class="chat-signature" id="chat-signature"></div>
@@ -292,7 +292,7 @@ appRoot.innerHTML = `
 
         <div class="transcript-frame">
           <div class="transcript" id="transcript" tabindex="0" aria-label="聊天记录"></div>
-          <div class="terminal-host" id="terminal-host" lang="zh-CN" aria-label="本机终端" hidden></div>
+          <div class="terminal-host" id="terminal-host" lang="zh-CN" aria-label="WSL 终端" hidden></div>
         </div>
 
         <div class="composer-splitter" aria-hidden="true"></div>
@@ -346,7 +346,7 @@ appRoot.innerHTML = `
         <div class="dialog-titlebar"><span id="about-title">关于 OICQ 2003</span><button id="dialog-close" aria-label="关闭">${icon("X", 12)}</button></div>
         <div class="dialog-body">
           <img src="${selfAvatar}" alt="OICQ 像素企鹅" />
-          <div><strong>OICQ 2003</strong><p>局域网即时通讯演示版</p><p>Rust + Tauri 2 / WebKitGTK</p></div>
+          <div><strong>OICQ 2003</strong><p>局域网即时通讯演示版</p><p>WebView2 GUI + WSL2 Terminal</p></div>
         </div>
         <div class="dialog-actions"><button class="xp-button default" id="dialog-ok">确定</button></div>
       </section>
@@ -459,7 +459,7 @@ function updateTerminalToolbarState(): void {
     !active || active.state === "opening";
   if (snapshot?.activeContactId === TERMINAL_CONTACT_ID) {
     query("#conversation-caption").textContent =
-      paneCount > 1 ? `本机终端会话 · ${paneCount} 个窗格` : "本机终端会话";
+      paneCount > 1 ? `WSL 终端会话 · ${paneCount} 个窗格` : "WSL 终端会话";
   }
 }
 
@@ -467,14 +467,14 @@ function updateTerminalConnectionStatus(): void {
   if (!snapshot?.activeContactId || !isTerminalContact()) return;
   const pane = activeTerminalPane();
   if (!pane) {
-    query("#connection-status").textContent = "正在启动本机终端...";
+    query("#connection-status").textContent = "正在启动 WSL 终端...";
     updateTypingStatus();
     return;
   }
-  const label = `终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`;
+  const label = `WSL 终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`;
   const descriptions: Record<TerminalPaneState, string> = {
-    opening: "正在连接 PTY...",
-    connected: "PTY 已连接 · 支持 Codex 流式输出",
+    opening: "正在连接 WSL PTY...",
+    connected: "WSL PTY 已连接 · 支持 Codex 流式输出",
     exited: "会话已结束 · 点击重启",
     error: "启动失败 · 点击重启",
   };
@@ -605,8 +605,8 @@ function renderTerminalLayout(): void {
   ids.forEach((paneId, index) => {
     const pane = terminalPanes.get(paneId);
     if (!pane) return;
-    pane.title.textContent = `终端 ${index + 1}`;
-    pane.element.setAttribute("aria-label", `终端窗格 ${index + 1}`);
+    pane.title.textContent = `WSL 终端 ${index + 1}`;
+    pane.element.setAttribute("aria-label", `WSL 终端窗格 ${index + 1}`);
     pane.closeButton.disabled = ids.length <= 1;
     updateTerminalPaneVisual(pane);
   });
@@ -784,7 +784,7 @@ function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): vo
       pane.lineBuffer = "";
       pane.terminal.write("\r\n");
       if (!command) {
-        pane.terminal.write("$ ");
+        pane.terminal.write("wsl$ ");
         continue;
       }
       void backend
@@ -792,14 +792,14 @@ function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): vo
         .then((execution) => {
           if (!pane.disposed) {
             pane.terminal.write(
-              `${execution.outputMessage.text.replace(/\n/g, "\r\n")}\r\n$ `,
+              `${execution.outputMessage.text.replace(/\n/g, "\r\n")}\r\nwsl$ `,
             );
           }
         })
         .catch((error) => {
           if (!pane.disposed) {
             pane.terminal.write(
-              `[error] ${error instanceof Error ? error.message : String(error)}\r\n$ `,
+              `[error] ${error instanceof Error ? error.message : String(error)}\r\nwsl$ `,
             );
           }
         });
@@ -829,10 +829,10 @@ function createTerminalPane(): TerminalPaneRuntime {
   lamp.setAttribute("aria-hidden", "true");
   const title = document.createElement("strong");
   title.className = "terminal-pane-title";
-  title.textContent = "终端";
+  title.textContent = "WSL 终端";
   const detail = document.createElement("span");
   detail.className = "terminal-pane-detail";
-  detail.textContent = "本机 PTY";
+  detail.textContent = "WSL PTY";
   const closeButton = document.createElement("button");
   closeButton.type = "button";
   closeButton.className = "terminal-pane-close";
@@ -950,7 +950,7 @@ function mountTerminalPane(pane: TerminalPaneRuntime): void {
   pane.resizeObserver = new ResizeObserver(scheduleTerminalFit);
   pane.resizeObserver.observe(pane.surface);
   if (!isTauriRuntime()) {
-    pane.terminal.write("Retro Messenger terminal preview\r\nType help to try the mock shell.\r\n$ ");
+    pane.terminal.write("Retro Messenger WSL 终端预览\r\n输入 help 查看模拟 Linux 命令。\r\nwsl$ ");
   }
   resizeTerminalPaneToFit(pane);
 }
@@ -1065,12 +1065,12 @@ async function restartTerminalPaneNow(pane: TerminalPaneRuntime): Promise<void> 
   if (pane.disposed) return;
   pane.terminal.reset();
   pane.terminal.clear();
-  pane.terminal.write("Retro Messenger terminal\r\n");
+  pane.terminal.write("Retro Messenger WSL terminal\r\n");
   pane.lineBuffer = "";
   if (isTauriRuntime()) await openTerminalPane(pane);
   else {
     pane.state = "connected";
-    pane.terminal.write("$ ");
+    pane.terminal.write("wsl$ ");
   }
   updateTerminalPaneVisual(pane);
   updateTerminalToolbarState();
@@ -1247,23 +1247,23 @@ function renderChatHeader(): void {
   transcript.hidden = terminalMode;
   query("#chat-contact-name").textContent = contact.displayName;
   query("#chat-presence").textContent = terminalMode
-    ? "[本机]"
+    ? "[WSL]"
     : `[${presenceText[contact.presence]}]`;
   query("#chat-account").textContent = contact.account;
   query("#chat-signature").textContent = terminalMode
-    ? "持久 PTY · 支持 ANSI、交互程序与 Codex 流式输出"
+    ? "WSL2 默认发行版 · 支持 ANSI、交互程序与 Codex 流式输出"
     : contact.statusMessage;
   query("#conversation-caption").textContent = terminalMode
-    ? "本机终端会话"
+    ? "WSL 终端会话"
     : `正在与 ${contact.displayName} 交谈`;
   query<HTMLElement>("#terminal-badge").hidden = !terminalMode;
   document.querySelectorAll<HTMLElement>(".terminal-only-control").forEach((control) => {
     control.hidden = !terminalMode;
   });
-  query(".format-hint").textContent = terminalMode ? "UTF-8 终端输入" : "纯文本";
+  query(".format-hint").textContent = terminalMode ? "UTF-8 WSL 输入" : "纯文本";
   query("#send-button span").textContent = terminalMode ? "输入(T)" : "发送(S)";
   messageInput.placeholder = terminalMode
-    ? "输入命令或中文内容，Enter 发送到终端"
+    ? "输入 Linux 命令或中文内容，Enter 发送到 WSL"
     : "";
   messageInput.setAttribute("aria-label", terminalMode ? "终端中文输入对话框" : "输入消息");
   transcript.setAttribute("aria-label", terminalMode ? "终端输出" : "聊天记录");
@@ -1315,7 +1315,7 @@ function renderMessages(forceBottom = false): void {
   const dateSeparator = document.createElement("div");
   dateSeparator.className = "date-separator";
   dateSeparator.innerHTML = isTerminalContact()
-    ? "<span>LOCAL TERMINAL</span>"
+    ? "<span>WSL TERMINAL</span>"
     : "<span>今天</span>";
   transcript.append(dateSeparator);
 
@@ -1351,10 +1351,10 @@ function updateTypingStatus(): void {
   if (isTerminalContact()) {
     const pane = activeTerminalPane();
     const label = pane
-      ? `终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`
-      : "终端";
+      ? `WSL 终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`
+      : "WSL 终端";
     status.textContent = pane?.state === "connected"
-      ? `${label} · PTY 已连接`
+      ? `${label} · WSL PTY 已连接`
       : `${label} · 未连接`;
     status.classList.add("terminal-active");
     status.classList.remove("active");
@@ -1374,7 +1374,7 @@ function updateSendState(): void {
   if (isTerminalContact()) {
     const pane = activeTerminalPane();
     const paneLabel = pane && terminalPanes.size > 1
-      ? ` · 发送到终端 ${terminalPanePosition(pane.id)}`
+      ? ` · 发送到 WSL 终端 ${terminalPanePosition(pane.id)}`
       : "";
     sendButton.disabled = !hasText;
     query("#send-tip").textContent = hasText
