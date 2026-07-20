@@ -4,6 +4,7 @@ import {
   Bold,
   ChevronDown,
   Clock3,
+  Columns2,
   createIcons,
   Eraser,
   FileUp,
@@ -20,6 +21,7 @@ import {
   Paperclip,
   Phone,
   RefreshCw,
+  Rows2,
   Search,
   Send,
   Settings,
@@ -40,7 +42,7 @@ import { FitAddon } from "@xterm/addon-fit";
 
 import "./styles.css";
 import "@xterm/xterm/css/xterm.css";
-import { backend } from "./backend";
+import { backend, type PtyExit } from "./backend";
 import {
   TERMINAL_CONTACT_ID,
   type AppSnapshot,
@@ -87,6 +89,7 @@ const iconSet = {
   Bold,
   ChevronDown,
   Clock3,
+  Columns2,
   Eraser,
   FileUp,
   History,
@@ -102,6 +105,7 @@ const iconSet = {
   Paperclip,
   Phone,
   RefreshCw,
+  Rows2,
   Search,
   Send,
   Settings,
@@ -128,6 +132,41 @@ type ResizeDirection =
   | "West"
   | "NorthWest";
 
+type TerminalSplitDirection = "left-right" | "top-bottom";
+type TerminalPaneState = "opening" | "connected" | "exited" | "error";
+type TerminalLayoutNode =
+  | { kind: "pane"; paneId: number }
+  | {
+      kind: "split";
+      direction: TerminalSplitDirection;
+      ratio: number;
+      first: TerminalLayoutNode;
+      second: TerminalLayoutNode;
+    };
+
+interface TerminalPaneRuntime {
+  id: number;
+  element: HTMLElement;
+  surface: HTMLElement;
+  title: HTMLElement;
+  closeButton: HTMLButtonElement;
+  terminal: XtermTerminal;
+  fit: FitAddon;
+  resizeObserver: ResizeObserver | null;
+  sessionId: number | null;
+  openPromise: Promise<void> | null;
+  lifecycleQueue: Promise<void>;
+  writeQueue: Promise<void>;
+  resizeQueue: Promise<void>;
+  resizeTimer: number | null;
+  lineBuffer: string;
+  generation: number;
+  state: TerminalPaneState;
+  mounted: boolean;
+  disposed: boolean;
+  disposables: IDisposable[];
+}
+
 let snapshot: AppSnapshot;
 let messages: Message[] = [];
 let activeTab: RosterTab = "friends";
@@ -135,22 +174,16 @@ let filterText = "";
 let typingContactId: string | null = null;
 let soundEnabled = true;
 let shouldStickToBottom = true;
-let terminal: XtermTerminal | null = null;
-let terminalFit: FitAddon | null = null;
-let terminalResizeObserver: ResizeObserver | null = null;
-let terminalSessionId: number | null = null;
-let terminalOpenPromise: Promise<void> | null = null;
-let terminalWriteQueue = Promise.resolve();
-let terminalResizeQueue = Promise.resolve();
-let terminalResizeTimer: number | null = null;
-let terminalLineBuffer = "";
-let terminalExitNotice = "";
-let terminalGeneration = 0;
 let messageInputComposing = false;
 let messageCompositionResetTimer: number | null = null;
 let lastWindowMaximized: boolean | null = null;
 let windowStateSyncScheduled = false;
-const terminalDisposables: IDisposable[] = [];
+let terminalLayout: TerminalLayoutNode | null = null;
+let activeTerminalPaneId: number | null = null;
+let nextTerminalPaneId = 1;
+let terminalFitFrame: number | null = null;
+const terminalPanes = new Map<number, TerminalPaneRuntime>();
+const MAX_TERMINAL_PANES = 4;
 const collapsedGroups = new Set<string>();
 const pendingReplies = new Set<string>();
 const messageDrafts = new Map<string, string>();
@@ -252,6 +285,8 @@ appRoot.innerHTML = `
           <button class="tool-button" id="history-button" title="查看聊天记录" aria-label="查看聊天记录">${icon("History", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-clear" title="清屏" aria-label="清屏">${icon("Eraser", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-restart" title="重启终端" aria-label="重启终端">${icon("RefreshCw", 15)}</button>
+          <button class="tool-button terminal-only-control" id="terminal-split-left-right" title="左右分屏（新建终端）" aria-label="左右分屏，新建终端">${icon("Columns2", 15)}</button>
+          <button class="tool-button terminal-only-control" id="terminal-split-top-bottom" title="上下分屏（新建终端）" aria-label="上下分屏，新建终端">${icon("Rows2", 15)}</button>
           <span class="actionbar-caption" id="conversation-caption">即时消息</span>
         </div>
 
@@ -359,225 +394,697 @@ function ptyBytes(value: unknown): Uint8Array {
   return new TextEncoder().encode(String(value ?? ""));
 }
 
-function terminalDimensions(): { rows: number; cols: number } {
+function activeTerminalPane(): TerminalPaneRuntime | null {
+  return activeTerminalPaneId === null
+    ? null
+    : terminalPanes.get(activeTerminalPaneId) ?? null;
+}
+
+function terminalPaneIds(
+  node: TerminalLayoutNode | null = terminalLayout,
+  result: number[] = [],
+): number[] {
+  if (!node) return result;
+  if (node.kind === "pane") result.push(node.paneId);
+  else {
+    terminalPaneIds(node.first, result);
+    terminalPaneIds(node.second, result);
+  }
+  return result;
+}
+
+function replaceTerminalPaneNode(
+  node: TerminalLayoutNode,
+  paneId: number,
+  replacement: TerminalLayoutNode,
+): TerminalLayoutNode {
+  if (node.kind === "pane") return node.paneId === paneId ? replacement : node;
   return {
-    rows: Math.max(1, terminal?.rows ?? 24),
-    cols: Math.max(2, terminal?.cols ?? 80),
+    ...node,
+    first: replaceTerminalPaneNode(node.first, paneId, replacement),
+    second: replaceTerminalPaneNode(node.second, paneId, replacement),
   };
 }
 
-function queuePtyWrite(data: Uint8Array): void {
-  const sessionId = terminalSessionId;
-  if (!sessionId || data.length === 0) return;
-  terminalWriteQueue = terminalWriteQueue
+function removeTerminalPaneNode(
+  node: TerminalLayoutNode,
+  paneId: number,
+): TerminalLayoutNode | null {
+  if (node.kind === "pane") return node.paneId === paneId ? null : node;
+  const first = removeTerminalPaneNode(node.first, paneId);
+  const second = removeTerminalPaneNode(node.second, paneId);
+  if (!first) return second;
+  if (!second) return first;
+  return { ...node, first, second };
+}
+
+function updateTerminalPaneVisual(pane: TerminalPaneRuntime): void {
+  pane.element.dataset.state = pane.state;
+  pane.element.classList.toggle("is-active", pane.id === activeTerminalPaneId);
+}
+
+function terminalPanePosition(paneId: number): number {
+  const position = terminalPaneIds().indexOf(paneId);
+  return position < 0 ? 1 : position + 1;
+}
+
+function updateTerminalToolbarState(): void {
+  const active = activeTerminalPane();
+  const paneCount = terminalPanes.size;
+  const splitDisabled = paneCount >= MAX_TERMINAL_PANES;
+  query<HTMLButtonElement>("#terminal-split-left-right").disabled = splitDisabled;
+  query<HTMLButtonElement>("#terminal-split-top-bottom").disabled = splitDisabled;
+  query<HTMLButtonElement>("#terminal-clear").disabled = !active;
+  query<HTMLButtonElement>("#terminal-restart").disabled =
+    !active || active.state === "opening";
+  if (snapshot?.activeContactId === TERMINAL_CONTACT_ID) {
+    query("#conversation-caption").textContent =
+      paneCount > 1 ? `本机终端会话 · ${paneCount} 个窗格` : "本机终端会话";
+  }
+}
+
+function updateTerminalConnectionStatus(): void {
+  if (!snapshot?.activeContactId || !isTerminalContact()) return;
+  const pane = activeTerminalPane();
+  if (!pane) {
+    query("#connection-status").textContent = "正在启动本机终端...";
+    updateTypingStatus();
+    return;
+  }
+  const label = `终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`;
+  const descriptions: Record<TerminalPaneState, string> = {
+    opening: "正在连接 PTY...",
+    connected: "PTY 已连接 · 支持 Codex 流式输出",
+    exited: "会话已结束 · 点击重启",
+    error: "启动失败 · 点击重启",
+  };
+  query("#connection-status").textContent = `${label} · ${descriptions[pane.state]}`;
+  updateTypingStatus();
+}
+
+function setActiveTerminalPane(pane: TerminalPaneRuntime, focus = false): void {
+  if (pane.disposed || terminalPanes.get(pane.id) !== pane) return;
+  activeTerminalPaneId = pane.id;
+  terminalPanes.forEach(updateTerminalPaneVisual);
+  updateTerminalToolbarState();
+  updateTerminalConnectionStatus();
+  updateSendState();
+  if (focus) pane.terminal.focus();
+}
+
+function setSplitElementRatio(
+  node: Extract<TerminalLayoutNode, { kind: "split" }>,
+  first: HTMLElement,
+  second: HTMLElement,
+  divider: HTMLElement,
+  ratio: number,
+): void {
+  node.ratio = Math.max(0.15, Math.min(0.85, ratio));
+  first.style.flex = `${node.ratio} 1 0px`;
+  second.style.flex = `${1 - node.ratio} 1 0px`;
+  divider.setAttribute("aria-valuenow", String(Math.round(node.ratio * 100)));
+}
+
+function updateSplitRatioFromPointer(
+  event: PointerEvent,
+  node: Extract<TerminalLayoutNode, { kind: "split" }>,
+  container: HTMLElement,
+  first: HTMLElement,
+  second: HTMLElement,
+  divider: HTMLElement,
+): void {
+  const rect = container.getBoundingClientRect();
+  const dividerSize = node.direction === "left-right"
+    ? divider.offsetWidth
+    : divider.offsetHeight;
+  const available = (node.direction === "left-right" ? rect.width : rect.height) - dividerSize;
+  if (available <= 2) return;
+  const pointer = node.direction === "left-right"
+    ? event.clientX - rect.left
+    : event.clientY - rect.top;
+  const minimumRatio = Math.min(0.42, Math.max(0.15, 92 / available));
+  const ratio = Math.max(
+    minimumRatio,
+    Math.min(1 - minimumRatio, (pointer - dividerSize / 2) / available),
+  );
+  setSplitElementRatio(node, first, second, divider, ratio);
+  scheduleTerminalFit();
+}
+
+function renderTerminalLayoutNode(node: TerminalLayoutNode): HTMLElement {
+  if (node.kind === "pane") {
+    const pane = terminalPanes.get(node.paneId);
+    if (!pane) throw new Error(`Missing terminal pane: ${node.paneId}`);
+    pane.element.style.flex = "";
+    return pane.element;
+  }
+
+  const container = document.createElement("div");
+  container.className = `terminal-split terminal-split--${node.direction}`;
+  const first = renderTerminalLayoutNode(node.first);
+  const second = renderTerminalLayoutNode(node.second);
+  const divider = document.createElement("div");
+  divider.className = `terminal-divider terminal-divider--${node.direction}`;
+  divider.tabIndex = 0;
+  divider.role = "separator";
+  divider.setAttribute(
+    "aria-orientation",
+    node.direction === "left-right" ? "vertical" : "horizontal",
+  );
+  divider.setAttribute(
+    "aria-label",
+    node.direction === "left-right" ? "调整左右分屏比例" : "调整上下分屏比例",
+  );
+  divider.setAttribute("aria-valuemin", "15");
+  divider.setAttribute("aria-valuemax", "85");
+  setSplitElementRatio(node, first, second, divider, node.ratio);
+
+  divider.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    divider.classList.add("is-dragging");
+    divider.setPointerCapture(event.pointerId);
+    const move = (moveEvent: PointerEvent) => {
+      updateSplitRatioFromPointer(moveEvent, node, container, first, second, divider);
+    };
+    const finish = () => {
+      divider.classList.remove("is-dragging");
+      divider.removeEventListener("pointermove", move);
+      divider.removeEventListener("pointerup", finish);
+      divider.removeEventListener("pointercancel", finish);
+      scheduleTerminalFit();
+    };
+    divider.addEventListener("pointermove", move);
+    divider.addEventListener("pointerup", finish);
+    divider.addEventListener("pointercancel", finish);
+  });
+  divider.addEventListener("keydown", (event) => {
+    const decrementKey = node.direction === "left-right" ? "ArrowLeft" : "ArrowUp";
+    const incrementKey = node.direction === "left-right" ? "ArrowRight" : "ArrowDown";
+    let ratio = node.ratio;
+    if (event.key === decrementKey) ratio -= 0.05;
+    else if (event.key === incrementKey) ratio += 0.05;
+    else if (event.key === "Home") ratio = 0.2;
+    else if (event.key === "End") ratio = 0.8;
+    else return;
+    event.preventDefault();
+    setSplitElementRatio(node, first, second, divider, ratio);
+    scheduleTerminalFit();
+  });
+
+  container.append(first, divider, second);
+  return container;
+}
+
+function renderTerminalLayout(): void {
+  const ids = terminalPaneIds();
+  terminalHost.classList.toggle("is-split", ids.length > 1);
+  if (terminalLayout) terminalHost.replaceChildren(renderTerminalLayoutNode(terminalLayout));
+  else terminalHost.replaceChildren();
+  ids.forEach((paneId, index) => {
+    const pane = terminalPanes.get(paneId);
+    if (!pane) return;
+    pane.title.textContent = `终端 ${index + 1}`;
+    pane.element.setAttribute("aria-label", `终端窗格 ${index + 1}`);
+    pane.closeButton.disabled = ids.length <= 1;
+    updateTerminalPaneVisual(pane);
+  });
+  updateTerminalToolbarState();
+  scheduleTerminalFit();
+}
+
+function queuePanePtyWrite(pane: TerminalPaneRuntime, data: Uint8Array): void {
+  const sessionId = pane.sessionId;
+  const generation = pane.generation;
+  if (!sessionId || data.length === 0 || pane.disposed) return;
+  pane.writeQueue = pane.writeQueue
     .catch(() => undefined)
-    .then(() => backend.writePty(sessionId, data))
+    .then(() => {
+      if (
+        pane.disposed ||
+        pane.generation !== generation ||
+        pane.sessionId !== sessionId
+      ) return;
+      return backend.writePty(sessionId, data);
+    })
     .catch((error) => {
-      if (sessionId === terminalSessionId) {
+      if (pane.generation === generation && pane.sessionId === sessionId) {
         showToast(error instanceof Error ? error.message : "终端输入失败");
       }
     });
 }
 
-function resizePtyToFit(): void {
-  if (!terminal || !terminalFit || terminalHost.hidden) return;
-  if (terminalHost.clientWidth < 2 || terminalHost.clientHeight < 2) return;
+function resizeTerminalPaneToFit(pane: TerminalPaneRuntime): void {
+  if (pane.disposed || !pane.mounted || terminalHost.hidden) return;
+  if (pane.surface.clientWidth < 2 || pane.surface.clientHeight < 2) return;
   try {
-    terminalFit.fit();
+    pane.fit.fit();
   } catch {
-    // FitAddon can briefly observe a zero-sized element while the pane changes.
+    // Layout transitions can expose a zero-sized pane for one animation frame.
   }
 }
 
-function schedulePtyResize(rows: number, cols: number): void {
-  if (!terminalSessionId) return;
-  if (terminalResizeTimer !== null) window.clearTimeout(terminalResizeTimer);
-  const sessionId = terminalSessionId;
-  terminalResizeTimer = window.setTimeout(() => {
-    terminalResizeTimer = null;
-    terminalResizeQueue = terminalResizeQueue
+function fitAllTerminalPanes(): void {
+  terminalPanes.forEach(resizeTerminalPaneToFit);
+}
+
+function scheduleTerminalFit(): void {
+  if (terminalFitFrame !== null) return;
+  terminalFitFrame = requestAnimationFrame(() => {
+    terminalFitFrame = null;
+    fitAllTerminalPanes();
+  });
+}
+
+function schedulePanePtyResize(
+  pane: TerminalPaneRuntime,
+  rows: number,
+  cols: number,
+): void {
+  const sessionId = pane.sessionId;
+  const generation = pane.generation;
+  if (!sessionId || pane.disposed) return;
+  if (pane.resizeTimer !== null) window.clearTimeout(pane.resizeTimer);
+  pane.resizeTimer = window.setTimeout(() => {
+    pane.resizeTimer = null;
+    pane.resizeQueue = pane.resizeQueue
       .catch(() => undefined)
       .then(() => {
-        if (sessionId !== terminalSessionId) return;
+        if (
+          pane.disposed ||
+          pane.generation !== generation ||
+          pane.sessionId !== sessionId
+        ) return;
         return backend.resizePty(sessionId, rows, cols);
       })
       .catch((error) => {
-        if (sessionId === terminalSessionId) {
+        if (pane.generation === generation && pane.sessionId === sessionId) {
           showToast(error instanceof Error ? error.message : "终端大小同步失败");
         }
       });
   }, 45);
 }
 
-function handleTerminalExit(exit: {
-  sessionId: number;
-  exitCode: number | null;
-  signal: string | null;
-  error: string | null;
-}): void {
-  if (exit.sessionId !== terminalSessionId) return;
-  terminalSessionId = null;
-  terminalExitNotice = exit.error
+function handleTerminalPaneExit(
+  pane: TerminalPaneRuntime,
+  generation: number,
+  exit: PtyExit,
+): void {
+  if (
+    pane.disposed ||
+    pane.generation !== generation ||
+    pane.sessionId !== exit.sessionId
+  ) return;
+  pane.sessionId = null;
+  pane.state = exit.error ? "error" : "exited";
+  const notice = exit.error
     ? `\r\n\r\n[终端错误] ${exit.error}\r\n`
     : `\r\n\r\n[终端已退出，exit ${exit.exitCode ?? "?"}${exit.signal ? ` · ${exit.signal}` : ""}]\r\n`;
-  terminal?.write(terminalExitNotice);
-  query("#connection-status").textContent = "终端会话已结束 · 点击重启";
-  updateTypingStatus();
+  pane.terminal.write(notice);
+  updateTerminalPaneVisual(pane);
+  updateTerminalToolbarState();
+  updateTerminalConnectionStatus();
 }
 
-async function openTerminalSession(force = false): Promise<void> {
-  if (!isTauriRuntime()) return;
-  if (terminalSessionId && !force) return;
-  if (terminalOpenPromise) return terminalOpenPromise;
-  const generation = ++terminalGeneration;
-  terminalOpenPromise = (async () => {
-    resizePtyToFit();
-    const { rows, cols } = terminalDimensions();
+async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
+  if (!isTauriRuntime() || pane.disposed || pane.sessionId) return;
+  if (pane.openPromise) return pane.openPromise;
+  const generation = ++pane.generation;
+  pane.state = "opening";
+  updateTerminalPaneVisual(pane);
+  updateTerminalToolbarState();
+  updateTerminalConnectionStatus();
+  resizeTerminalPaneToFit(pane);
+
+  let returnedSessionId: number | null = null;
+  let earlyExit: PtyExit | null = null;
+  let opening!: Promise<void>;
+  opening = (async () => {
+    const rows = Math.max(1, pane.terminal.rows || 24);
+    const cols = Math.max(2, pane.terminal.cols || 80);
     const sessionId = await backend.openPty(
       rows,
       cols,
       (data) => {
-        if (generation === terminalGeneration) terminal?.write(ptyBytes(data));
+        if (
+          !pane.disposed &&
+          pane.generation === generation &&
+          terminalPanes.get(pane.id) === pane
+        ) pane.terminal.write(ptyBytes(data));
       },
-      handleTerminalExit,
+      (exit) => {
+        if (returnedSessionId === null) earlyExit = exit;
+        else handleTerminalPaneExit(pane, generation, exit);
+      },
     );
-    terminalSessionId = sessionId;
-    terminalExitNotice = "";
-    resizePtyToFit();
-    query("#connection-status").textContent = "本机终端已连接 · 支持 Codex 流式输出";
-    updateTypingStatus();
+    returnedSessionId = sessionId;
+    if (
+      pane.disposed ||
+      pane.generation !== generation ||
+      terminalPanes.get(pane.id) !== pane
+    ) {
+      await backend.closePty(sessionId);
+      return;
+    }
+    pane.sessionId = sessionId;
+    pane.state = "connected";
+    updateTerminalPaneVisual(pane);
+    resizeTerminalPaneToFit(pane);
+    if (earlyExit) handleTerminalPaneExit(pane, generation, earlyExit);
+    updateTerminalToolbarState();
+    updateTerminalConnectionStatus();
   })()
     .catch((error) => {
-      terminal?.write(`\r\n[无法启动终端] ${error instanceof Error ? error.message : String(error)}\r\n`);
-      query("#connection-status").textContent = "终端启动失败";
+      if (
+        pane.disposed ||
+        pane.generation !== generation ||
+        terminalPanes.get(pane.id) !== pane
+      ) return;
+      pane.state = "error";
+      pane.terminal.write(
+        `\r\n[无法启动终端] ${error instanceof Error ? error.message : String(error)}\r\n`,
+      );
+      updateTerminalPaneVisual(pane);
       showToast(error instanceof Error ? error.message : "无法启动终端");
+      updateTerminalToolbarState();
+      updateTerminalConnectionStatus();
     })
     .finally(() => {
-      terminalOpenPromise = null;
+      if (pane.openPromise === opening) pane.openPromise = null;
     });
-  return terminalOpenPromise;
+  pane.openPromise = opening;
+  return opening;
 }
 
-function handlePreviewTerminalInput(data: string): void {
+function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): void {
   for (const character of data) {
     if (character === "\r" || character === "\n") {
-      const command = terminalLineBuffer.trim();
-      terminalLineBuffer = "";
-      terminal?.write("\r\n");
+      const command = pane.lineBuffer.trim();
+      pane.lineBuffer = "";
+      pane.terminal.write("\r\n");
       if (!command) {
-        terminal?.write("$ ");
+        pane.terminal.write("$ ");
         continue;
       }
       void backend
         .executeTerminal(command)
         .then((execution) => {
-          terminal?.write(`${execution.outputMessage.text.replace(/\n/g, "\r\n")}\r\n$ `);
+          if (!pane.disposed) {
+            pane.terminal.write(
+              `${execution.outputMessage.text.replace(/\n/g, "\r\n")}\r\n$ `,
+            );
+          }
         })
-        .catch((error) => terminal?.write(`[error] ${error instanceof Error ? error.message : String(error)}\r\n$ `));
+        .catch((error) => {
+          if (!pane.disposed) {
+            pane.terminal.write(
+              `[error] ${error instanceof Error ? error.message : String(error)}\r\n$ `,
+            );
+          }
+        });
     } else if (character === "\u007f" || character === "\b") {
-      if (terminalLineBuffer.length > 0) {
-        terminalLineBuffer = terminalLineBuffer.slice(0, -1);
-        terminal?.write("\b \b");
+      if (pane.lineBuffer.length > 0) {
+        pane.lineBuffer = pane.lineBuffer.slice(0, -1);
+        pane.terminal.write("\b \b");
       }
     } else if (character >= " ") {
-      terminalLineBuffer += character;
-      terminal?.write(character);
+      pane.lineBuffer += character;
+      pane.terminal.write(character);
     }
   }
 }
 
-function ensureTerminal(focus = true): void {
+function createTerminalPane(): TerminalPaneRuntime {
+  const id = nextTerminalPaneId++;
+  const element = document.createElement("section");
+  element.className = "terminal-pane";
+  element.dataset.paneId = String(id);
+  element.setAttribute("role", "group");
+
+  const titlebar = document.createElement("header");
+  titlebar.className = "terminal-pane-titlebar";
+  const lamp = document.createElement("span");
+  lamp.className = "terminal-pane-lamp";
+  lamp.setAttribute("aria-hidden", "true");
+  const title = document.createElement("strong");
+  title.className = "terminal-pane-title";
+  title.textContent = "终端";
+  const detail = document.createElement("span");
+  detail.className = "terminal-pane-detail";
+  detail.textContent = "本机 PTY";
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.className = "terminal-pane-close";
+  closeButton.title = "关闭此终端窗格";
+  closeButton.setAttribute("aria-label", "关闭此终端窗格");
+  closeButton.textContent = "×";
+  titlebar.append(lamp, title, detail, closeButton);
+
+  const surface = document.createElement("div");
+  surface.className = "terminal-pane-surface";
+  surface.lang = "zh-CN";
+  element.append(titlebar, surface);
+
+  const terminal = new XtermTerminal({
+    allowTransparency: false,
+    convertEol: false,
+    cursorBlink: true,
+    cursorStyle: "bar",
+    disableStdin: false,
+    fontFamily: '"Cascadia Mono", "JetBrains Mono", "Noto Sans Mono CJK SC", "WenQuanYi Micro Hei Mono", Consolas, monospace',
+    fontSize: 14,
+    lineHeight: 1.25,
+    scrollback: 20_000,
+    smoothScrollDuration: 0,
+    tabStopWidth: 8,
+    theme: {
+      background: "#fffdf3",
+      foreground: "#1d2428",
+      cursor: "#0050ee",
+      cursorAccent: "#fffdf3",
+      selectionBackground: "#b9d5f4",
+      black: "#172026",
+      red: "#a52a2a",
+      green: "#176b35",
+      yellow: "#886900",
+      blue: "#1e4f9b",
+      magenta: "#7c3f7b",
+      cyan: "#1d6971",
+      white: "#d7d5c9",
+      brightBlack: "#5e666b",
+      brightRed: "#be3f3f",
+      brightGreen: "#237f43",
+      brightYellow: "#a17f00",
+      brightBlue: "#316ac5",
+      brightMagenta: "#9a5a9a",
+      brightCyan: "#2d8b91",
+      brightWhite: "#ffffff",
+    },
+  });
+  const fit = new FitAddon();
+  terminal.loadAddon(fit);
+  const pane: TerminalPaneRuntime = {
+    id,
+    element,
+    surface,
+    title,
+    closeButton,
+    terminal,
+    fit,
+    resizeObserver: null,
+    sessionId: null,
+    openPromise: null,
+    lifecycleQueue: Promise.resolve(),
+    writeQueue: Promise.resolve(),
+    resizeQueue: Promise.resolve(),
+    resizeTimer: null,
+    lineBuffer: "",
+    generation: 0,
+    state: isTauriRuntime() ? "opening" : "connected",
+    mounted: false,
+    disposed: false,
+    disposables: [],
+  };
+  element.addEventListener(
+    "mousedown",
+    (event) => {
+      if ((event.target as Element).closest(".terminal-pane-close")) return;
+      setActiveTerminalPane(pane);
+    },
+    { capture: true },
+  );
+  element.addEventListener("focusin", () => setActiveTerminalPane(pane));
+  titlebar.addEventListener("mousedown", (event) => {
+    if ((event.target as Element).closest(".terminal-pane-close")) return;
+    window.setTimeout(() => pane.terminal.focus(), 0);
+  });
+  closeButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void closeTerminalPane(pane.id);
+  });
+  return pane;
+}
+
+function mountTerminalPane(pane: TerminalPaneRuntime): void {
+  if (pane.mounted || pane.disposed) return;
+  pane.terminal.open(pane.surface);
+  pane.mounted = true;
+  pane.disposables.push(
+    pane.terminal.onData((data) => {
+      if (isTauriRuntime()) queuePanePtyWrite(pane, new TextEncoder().encode(data));
+      else handlePreviewTerminalInput(pane, data);
+    }),
+    pane.terminal.onBinary((data) => {
+      if (isTauriRuntime()) {
+        queuePanePtyWrite(
+          pane,
+          Uint8Array.from(data, (character) => character.charCodeAt(0) & 0xff),
+        );
+      }
+    }),
+    pane.terminal.onResize(({ rows, cols }) => {
+      schedulePanePtyResize(pane, rows, cols);
+    }),
+  );
+  pane.resizeObserver = new ResizeObserver(scheduleTerminalFit);
+  pane.resizeObserver.observe(pane.surface);
+  if (!isTauriRuntime()) {
+    pane.terminal.write("Retro Messenger terminal preview\r\nType help to try the mock shell.\r\n$ ");
+  }
+  resizeTerminalPaneToFit(pane);
+}
+
+function ensureTerminal(focus = true): TerminalPaneRuntime | null {
   terminalHost.hidden = false;
   transcript.hidden = true;
-  if (!terminal) {
-    terminal = new XtermTerminal({
-      allowTransparency: false,
-      convertEol: false,
-      cursorBlink: true,
-      cursorStyle: "bar",
-      disableStdin: false,
-      fontFamily: '"Cascadia Mono", "JetBrains Mono", "Noto Sans Mono CJK SC", "WenQuanYi Micro Hei Mono", Consolas, monospace',
-      fontSize: 14,
-      lineHeight: 1.25,
-      scrollback: 20_000,
-      smoothScrollDuration: 0,
-      tabStopWidth: 8,
-      theme: {
-        background: "#fffdf3",
-        foreground: "#1d2428",
-        cursor: "#0050ee",
-        cursorAccent: "#fffdf3",
-        selectionBackground: "#b9d5f4",
-        black: "#172026",
-        red: "#a52a2a",
-        green: "#176b35",
-        yellow: "#886900",
-        blue: "#1e4f9b",
-        magenta: "#7c3f7b",
-        cyan: "#1d6971",
-        white: "#d7d5c9",
-        brightBlack: "#5e666b",
-        brightRed: "#be3f3f",
-        brightGreen: "#237f43",
-        brightYellow: "#a17f00",
-        brightBlue: "#316ac5",
-        brightMagenta: "#9a5a9a",
-        brightCyan: "#2d8b91",
-        brightWhite: "#ffffff",
-      },
-    });
-    terminalFit = new FitAddon();
-    terminal.loadAddon(terminalFit);
-    terminal.open(terminalHost);
-    terminalDisposables.push(
-      terminal.onData((data) => {
-        if (isTauriRuntime()) queuePtyWrite(new TextEncoder().encode(data));
-        else handlePreviewTerminalInput(data);
-      }),
-      terminal.onBinary((data) => {
-        if (isTauriRuntime()) {
-          queuePtyWrite(Uint8Array.from(data, (character) => character.charCodeAt(0) & 0xff));
-        }
-      }),
-      terminal.onResize(({ rows, cols }) => {
-        schedulePtyResize(rows, cols);
-      }),
-    );
-    terminalResizeObserver = new ResizeObserver(() => resizePtyToFit());
-    terminalResizeObserver.observe(terminalHost);
-    if (!isTauriRuntime()) {
-      terminal.write("Retro Messenger terminal preview\r\nType help to try the mock shell.\r\n$ ");
-    }
+  if (!terminalLayout) {
+    const pane = createTerminalPane();
+    terminalPanes.set(pane.id, pane);
+    terminalLayout = { kind: "pane", paneId: pane.id };
+    activeTerminalPaneId = pane.id;
+    renderTerminalLayout();
+    mountTerminalPane(pane);
   }
-  resizePtyToFit();
-  if (isTauriRuntime()) void openTerminalSession();
-  if (focus) terminal.focus();
+  fitAllTerminalPanes();
+  terminalPanes.forEach((pane) => {
+    if (isTauriRuntime() && !pane.sessionId && !pane.openPromise) {
+      void openTerminalPane(pane);
+    }
+  });
+  const active = activeTerminalPane();
+  if (focus) active?.terminal.focus();
+  scheduleTerminalFit();
+  return active;
+}
+
+async function splitActiveTerminal(direction: TerminalSplitDirection): Promise<void> {
+  const active = ensureTerminal(false);
+  if (!active || !terminalLayout) return;
+  if (terminalPanes.size >= MAX_TERMINAL_PANES) {
+    showToast(`最多可同时打开 ${MAX_TERMINAL_PANES} 个终端窗格`);
+    return;
+  }
+  const pane = createTerminalPane();
+  terminalPanes.set(pane.id, pane);
+  terminalLayout = replaceTerminalPaneNode(terminalLayout, active.id, {
+    kind: "split",
+    direction,
+    ratio: 0.5,
+    first: { kind: "pane", paneId: active.id },
+    second: { kind: "pane", paneId: pane.id },
+  });
+  activeTerminalPaneId = pane.id;
+  renderTerminalLayout();
+  mountTerminalPane(pane);
+  setActiveTerminalPane(pane, true);
+  fitAllTerminalPanes();
+  if (isTauriRuntime()) await openTerminalPane(pane);
+  scheduleTerminalFit();
+}
+
+async function disposeTerminalPane(
+  pane: TerminalPaneRuntime,
+  alreadyInvalidated = false,
+): Promise<void> {
+  if (pane.disposed && !alreadyInvalidated) return;
+  if (!alreadyInvalidated) {
+    pane.disposed = true;
+    pane.generation += 1;
+  }
+  if (pane.resizeTimer !== null) {
+    window.clearTimeout(pane.resizeTimer);
+    pane.resizeTimer = null;
+  }
+  pane.resizeObserver?.disconnect();
+  pane.resizeObserver = null;
+  pane.disposables.splice(0).forEach((disposable) => disposable.dispose());
+  const sessionId = pane.sessionId;
+  pane.sessionId = null;
+  pane.terminal.dispose();
+  if (sessionId) await backend.closePty(sessionId);
+}
+
+async function closeTerminalPane(paneId: number): Promise<void> {
+  if (terminalPanes.size <= 1 || !terminalLayout) return;
+  const pane = terminalPanes.get(paneId);
+  if (!pane) return;
+  const previousIds = terminalPaneIds();
+  const previousIndex = previousIds.indexOf(paneId);
+  pane.disposed = true;
+  pane.generation += 1;
+  terminalPanes.delete(paneId);
+  terminalLayout = removeTerminalPaneNode(terminalLayout, paneId);
+  const remainingIds = terminalPaneIds();
+  if (activeTerminalPaneId === paneId) {
+    activeTerminalPaneId =
+      remainingIds[Math.min(Math.max(previousIndex, 0), remainingIds.length - 1)] ?? null;
+  }
+  renderTerminalLayout();
+  await disposeTerminalPane(pane, true);
+  const active = activeTerminalPane();
+  if (active) setActiveTerminalPane(active, true);
+  scheduleTerminalFit();
+}
+
+async function restartTerminalPaneNow(pane: TerminalPaneRuntime): Promise<void> {
+  if (pane.disposed || terminalPanes.get(pane.id) !== pane) return;
+  pane.generation += 1;
+  const pendingOpen = pane.openPromise;
+  pane.writeQueue = Promise.resolve();
+  pane.resizeQueue = Promise.resolve();
+  if (pane.resizeTimer !== null) {
+    window.clearTimeout(pane.resizeTimer);
+    pane.resizeTimer = null;
+  }
+  if (pendingOpen) await pendingOpen;
+  if (pane.disposed) return;
+  const oldSession = pane.sessionId;
+  pane.sessionId = null;
+  if (oldSession) await backend.closePty(oldSession);
+  if (pane.disposed) return;
+  pane.terminal.reset();
+  pane.terminal.clear();
+  pane.terminal.write("Retro Messenger terminal\r\n");
+  pane.lineBuffer = "";
+  if (isTauriRuntime()) await openTerminalPane(pane);
+  else {
+    pane.state = "connected";
+    pane.terminal.write("$ ");
+  }
+  updateTerminalPaneVisual(pane);
+  updateTerminalToolbarState();
+  updateTerminalConnectionStatus();
+  pane.terminal.focus();
 }
 
 async function restartTerminal(): Promise<void> {
-  if (!terminal) return;
-  terminalGeneration += 1;
-  terminalWriteQueue = Promise.resolve();
-  terminalResizeQueue = Promise.resolve();
-  if (terminalResizeTimer !== null) {
-    window.clearTimeout(terminalResizeTimer);
-    terminalResizeTimer = null;
-  }
-  if (terminalSessionId) {
-    const oldSession = terminalSessionId;
-    terminalSessionId = null;
-    await backend.closePty(oldSession);
-  }
-  terminal.reset();
-  terminal.clear();
-  terminal.write("Retro Messenger terminal\r\n");
-  if (isTauriRuntime()) {
-    await openTerminalSession(true);
-  } else {
-    terminalLineBuffer = "";
-    terminal.write("$ ");
-  }
-  terminal.focus();
+  const pane = activeTerminalPane();
+  if (!pane) return;
+  pane.lifecycleQueue = pane.lifecycleQueue
+    .catch(() => undefined)
+    .then(() => restartTerminalPaneNow(pane));
+  return pane.lifecycleQueue;
 }
 
 function getActiveContact(): Contact {
@@ -842,7 +1349,13 @@ function renderMessages(forceBottom = false): void {
 function updateTypingStatus(): void {
   const status = query("#typing-status");
   if (isTerminalContact()) {
-    status.textContent = terminalSessionId ? "终端 · PTY 已连接" : "终端 · 未连接";
+    const pane = activeTerminalPane();
+    const label = pane
+      ? `终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`
+      : "终端";
+    status.textContent = pane?.state === "connected"
+      ? `${label} · PTY 已连接`
+      : `${label} · 未连接`;
     status.classList.add("terminal-active");
     status.classList.remove("active");
   } else if (typingContactId === snapshot.activeContactId) {
@@ -859,10 +1372,14 @@ function updateTypingStatus(): void {
 function updateSendState(): void {
   const hasText = messageInput.value.trim().length > 0;
   if (isTerminalContact()) {
+    const pane = activeTerminalPane();
+    const paneLabel = pane && terminalPanes.size > 1
+      ? ` · 发送到终端 ${terminalPanePosition(pane.id)}`
+      : "";
     sendButton.disabled = !hasText;
     query("#send-tip").textContent = hasText
-      ? `${messageInput.value.length}/2000 · 中文输入法可用 · Enter 输入`
-      : "中文输入法可用 · Enter 输入，Shift+Enter 换行";
+      ? `${messageInput.value.length}/2000 · 中文输入法可用${paneLabel} · Enter 输入`
+      : `中文输入法可用${paneLabel} · Enter 输入，Shift+Enter 换行`;
     return;
   }
   sendButton.disabled = !hasText;
@@ -881,7 +1398,6 @@ async function selectContact(contactId: string): Promise<void> {
   if (contactId === snapshot.activeContactId && shell.classList.contains("show-chat")) {
     if (isTerminalContact(contactId)) {
       ensureTerminal();
-      if (!terminalSessionId) void openTerminalSession();
     }
     return;
   }
@@ -902,13 +1418,13 @@ async function selectContact(contactId: string): Promise<void> {
     replaceContact(contact);
     renderContacts();
     renderMessages(true);
-    query("#connection-status").textContent = isTerminalContact(contactId)
-      ? terminalSessionId
-        ? "本机终端已连接 · 支持 Codex 流式输出"
-        : "正在启动本机终端..."
-      : "已连接到消息服务器";
-    if (isTerminalContact(contactId)) terminal?.focus();
-    else messageInput.focus();
+    if (isTerminalContact(contactId)) {
+      updateTerminalConnectionStatus();
+      activeTerminalPane()?.terminal.focus();
+    } else {
+      query("#connection-status").textContent = "已连接到消息服务器";
+      messageInput.focus();
+    }
   } catch (error) {
     showToast(error instanceof Error ? error.message : "读取会话失败");
   }
@@ -947,10 +1463,10 @@ async function scheduleReply(contactId: string): Promise<void> {
   }
 }
 
-function terminalSubmissionBytes(value: string): Uint8Array {
+function terminalSubmissionBytes(value: string, pane: TerminalPaneRuntime): Uint8Array {
   // Match xterm's own paste normalization: a terminal Enter key is CR, not LF.
   const normalized = value.replace(/\r\n|\r|\n/g, "\r");
-  const input = terminal?.modes.bracketedPasteMode
+  const input = pane.terminal.modes.bracketedPasteMode
     ? `\u001b[200~${normalized}\u001b[201~`
     : normalized;
   return new TextEncoder().encode(`${input}\r`);
@@ -965,13 +1481,14 @@ async function sendCurrentMessage(overrideText?: string): Promise<void> {
   try {
     if (isTerminalContact(contactId)) {
       // Keep the standard textarea focused so the platform IME context stays alive.
-      ensureTerminal(false);
+      const pane = ensureTerminal(false);
+      if (!pane) throw new Error("没有可用的终端窗格");
       if (isTauriRuntime()) {
-        if (!terminalSessionId) await openTerminalSession();
-        if (!terminalSessionId) throw new Error("终端尚未连接，请点击重启终端");
-        queuePtyWrite(terminalSubmissionBytes(text));
+        if (!pane.sessionId) await openTerminalPane(pane);
+        if (!pane.sessionId) throw new Error("终端尚未连接，请点击重启终端");
+        queuePanePtyWrite(pane, terminalSubmissionBytes(text, pane));
       } else {
-        handlePreviewTerminalInput(`${text}\r`);
+        handlePreviewTerminalInput(pane, `${text}\r`);
       }
       messageInput.value = "";
       messageDrafts.delete(contactId);
@@ -1178,14 +1695,6 @@ function bindEvents(): void {
   query("#maximize-window").addEventListener("click", () => void windowAction("maximize"));
   query("#close-window").addEventListener("click", () => void windowAction("close"));
 
-  terminalHost.addEventListener(
-    "mousedown",
-    () => {
-      window.setTimeout(() => terminal?.focus(), 0);
-    },
-    { capture: true },
-  );
-
   query<HTMLInputElement>("#contact-search").addEventListener("input", (event) => {
     filterText = (event.currentTarget as HTMLInputElement).value;
     renderContacts();
@@ -1254,18 +1763,26 @@ function bindEvents(): void {
   query("#nudge-button").addEventListener("click", () => void sendNudge());
   query("#history-button").addEventListener("click", () => {
     if (isTerminalContact()) {
-      terminal?.scrollToBottom();
-      terminal?.focus();
+      const pane = activeTerminalPane();
+      pane?.terminal.scrollToBottom();
+      pane?.terminal.focus();
     } else {
       transcript.scrollTo({ top: 0, behavior: "smooth" });
       showToast("已定位到今天的第一条记录");
     }
   });
   query("#terminal-clear").addEventListener("click", () => {
-    terminal?.clear();
-    terminal?.focus();
+    const pane = activeTerminalPane();
+    pane?.terminal.clear();
+    pane?.terminal.focus();
   });
   query("#terminal-restart").addEventListener("click", () => void restartTerminal());
+  query("#terminal-split-left-right").addEventListener("click", () => {
+    void splitActiveTerminal("left-right");
+  });
+  query("#terminal-split-top-bottom").addEventListener("click", () => {
+    void splitActiveTerminal("top-bottom");
+  });
   query("#invite-contact").addEventListener("click", () => showToast("当前会话仅支持双人聊天"));
   query("#mobile-back").addEventListener("click", () => shell.classList.remove("show-chat"));
 
@@ -1337,8 +1854,14 @@ async function start(): Promise<void> {
   void syncWindowState();
   if (isTauriRuntime()) {
     const appWindow = getCurrentWindow();
-    void appWindow.onResized(scheduleWindowStateSync);
-    void appWindow.onMoved(scheduleWindowStateSync);
+    void appWindow.onResized(() => {
+      scheduleWindowStateSync();
+      scheduleTerminalFit();
+    });
+    void appWindow.onMoved(() => {
+      scheduleWindowStateSync();
+      scheduleTerminalFit();
+    });
   }
   updateClock();
   window.setInterval(updateClock, 1000);
@@ -1355,7 +1878,7 @@ async function start(): Promise<void> {
     updateTypingStatus();
     updateSendState();
     refreshIcons();
-    if (isTerminalContact()) terminal?.focus();
+    if (isTerminalContact()) activeTerminalPane()?.terminal.focus();
     else messageInput.focus();
   } catch (error) {
     query("#connection-status").textContent = "连接失败";
