@@ -19,7 +19,9 @@ import {
   MoreHorizontal,
   Palette,
   Paperclip,
+  Pencil,
   Phone,
+  Plus,
   RefreshCw,
   Rows2,
   Search,
@@ -103,7 +105,9 @@ const iconSet = {
   MoreHorizontal,
   Palette,
   Paperclip,
+  Pencil,
   Phone,
+  Plus,
   RefreshCw,
   Rows2,
   Search,
@@ -145,6 +149,7 @@ type TerminalLayoutNode =
     };
 
 interface TerminalPaneRuntime {
+  workspace: TerminalWorkspace;
   id: number;
   element: HTMLElement;
   surface: HTMLElement;
@@ -167,6 +172,15 @@ interface TerminalPaneRuntime {
   disposables: IDisposable[];
 }
 
+interface TerminalWorkspace {
+  contactId: string;
+  layout: TerminalLayoutNode | null;
+  activePaneId: number | null;
+  nextPaneId: number;
+  fitFrame: number | null;
+  panes: Map<number, TerminalPaneRuntime>;
+}
+
 let snapshot: AppSnapshot;
 let messages: Message[] = [];
 let activeTab: RosterTab = "friends";
@@ -178,11 +192,8 @@ let messageInputComposing = false;
 let messageCompositionResetTimer: number | null = null;
 let lastWindowMaximized: boolean | null = null;
 let windowStateSyncScheduled = false;
-let terminalLayout: TerminalLayoutNode | null = null;
-let activeTerminalPaneId: number | null = null;
-let nextTerminalPaneId = 1;
-let terminalFitFrame: number | null = null;
-const terminalPanes = new Map<number, TerminalPaneRuntime>();
+let renamingTerminalId: string | null = null;
+const terminalWorkspaces = new Map<string, TerminalWorkspace>();
 const MAX_TERMINAL_PANES = 4;
 const collapsedGroups = new Set<string>();
 const pendingReplies = new Set<string>();
@@ -283,6 +294,7 @@ appRoot.innerHTML = `
           <button class="tool-button" disabled title="视频通话（暂不可用）" aria-label="视频通话，暂不可用">${icon("Video", 15)}</button>
           <span class="tool-separator"></span>
           <button class="tool-button" id="history-button" title="查看聊天记录" aria-label="查看聊天记录">${icon("History", 15)}</button>
+          <button class="tool-button terminal-only-control" id="terminal-rename" title="重命名终端" aria-label="重命名终端">${icon("Pencil", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-clear" title="清屏" aria-label="清屏">${icon("Eraser", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-restart" title="重启终端" aria-label="重启终端">${icon("RefreshCw", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-split-left-right" title="左右分屏（新建终端）" aria-label="左右分屏，新建终端">${icon("Columns2", 15)}</button>
@@ -341,6 +353,22 @@ appRoot.innerHTML = `
 
     <div class="popup-menu" id="popup-menu" role="menu" hidden></div>
     <div class="toast" id="toast" role="status" hidden></div>
+    <div class="dialog-backdrop" id="terminal-rename-dialog" hidden>
+      <section class="xp-dialog rename-terminal-dialog" role="dialog" aria-modal="true" aria-labelledby="terminal-rename-title">
+        <form id="terminal-rename-form">
+          <div class="dialog-titlebar"><span id="terminal-rename-title">重命名 WSL 终端</span><button type="button" id="terminal-rename-close" aria-label="关闭">${icon("X", 12)}</button></div>
+          <div class="dialog-body rename-terminal-body">
+            <label for="terminal-name-input">终端名称</label>
+            <input id="terminal-name-input" type="text" maxlength="24" autocomplete="off" spellcheck="false" />
+            <p class="dialog-field-error" id="terminal-rename-error" role="alert"></p>
+          </div>
+          <div class="dialog-actions">
+            <button class="xp-button" type="button" id="terminal-rename-cancel">取消</button>
+            <button class="xp-button default" type="submit">保存</button>
+          </div>
+        </form>
+      </section>
+    </div>
     <div class="dialog-backdrop" id="about-dialog" hidden>
       <section class="xp-dialog" role="dialog" aria-modal="true" aria-labelledby="about-title">
         <div class="dialog-titlebar"><span id="about-title">关于 OICQ 2003</span><button id="dialog-close" aria-label="关闭">${icon("X", 12)}</button></div>
@@ -369,6 +397,9 @@ const messageInput = query<HTMLTextAreaElement>("#message-input");
 const sendButton = query<HTMLButtonElement>("#send-button");
 const popupMenu = query<HTMLDivElement>("#popup-menu");
 const toast = query<HTMLDivElement>("#toast");
+const terminalRenameDialog = query<HTMLDivElement>("#terminal-rename-dialog");
+const terminalNameInput = query<HTMLInputElement>("#terminal-name-input");
+const terminalRenameError = query<HTMLParagraphElement>("#terminal-rename-error");
 const aboutDialog = query<HTMLDivElement>("#about-dialog");
 
 function isTauriRuntime(): boolean {
@@ -376,7 +407,7 @@ function isTauriRuntime(): boolean {
 }
 
 function isTerminalContact(contactId = snapshot?.activeContactId): boolean {
-  return contactId === TERMINAL_CONTACT_ID;
+  return contactId === TERMINAL_CONTACT_ID || /^terminal-\d+$/.test(contactId ?? "");
 }
 
 function refreshIcons(): void {
@@ -394,14 +425,36 @@ function ptyBytes(value: unknown): Uint8Array {
   return new TextEncoder().encode(String(value ?? ""));
 }
 
-function activeTerminalPane(): TerminalPaneRuntime | null {
-  return activeTerminalPaneId === null
+function terminalWorkspace(
+  contactId = snapshot?.activeContactId,
+  create = false,
+): TerminalWorkspace | null {
+  if (!contactId || !isTerminalContact(contactId)) return null;
+  let workspace = terminalWorkspaces.get(contactId);
+  if (!workspace && create) {
+    workspace = {
+      contactId,
+      layout: null,
+      activePaneId: null,
+      nextPaneId: 1,
+      fitFrame: null,
+      panes: new Map(),
+    };
+    terminalWorkspaces.set(contactId, workspace);
+  }
+  return workspace ?? null;
+}
+
+function activeTerminalPane(
+  workspace = terminalWorkspace(),
+): TerminalPaneRuntime | null {
+  return !workspace || workspace.activePaneId === null
     ? null
-    : terminalPanes.get(activeTerminalPaneId) ?? null;
+    : workspace.panes.get(workspace.activePaneId) ?? null;
 }
 
 function terminalPaneIds(
-  node: TerminalLayoutNode | null = terminalLayout,
+  node: TerminalLayoutNode | null = terminalWorkspace()?.layout ?? null,
   result: number[] = [],
 ): number[] {
   if (!node) return result;
@@ -440,38 +493,50 @@ function removeTerminalPaneNode(
 
 function updateTerminalPaneVisual(pane: TerminalPaneRuntime): void {
   pane.element.dataset.state = pane.state;
-  pane.element.classList.toggle("is-active", pane.id === activeTerminalPaneId);
+  pane.element.classList.toggle(
+    "is-active",
+    pane.id === pane.workspace.activePaneId,
+  );
 }
 
-function terminalPanePosition(paneId: number): number {
-  const position = terminalPaneIds().indexOf(paneId);
+function terminalPanePosition(
+  paneId: number,
+  workspace = terminalWorkspace(),
+): number {
+  const position = terminalPaneIds(workspace?.layout ?? null).indexOf(paneId);
   return position < 0 ? 1 : position + 1;
 }
 
 function updateTerminalToolbarState(): void {
-  const active = activeTerminalPane();
-  const paneCount = terminalPanes.size;
+  const workspace = terminalWorkspace();
+  const active = activeTerminalPane(workspace);
+  const paneCount = workspace?.panes.size ?? 0;
   const splitDisabled = paneCount >= MAX_TERMINAL_PANES;
   query<HTMLButtonElement>("#terminal-split-left-right").disabled = splitDisabled;
   query<HTMLButtonElement>("#terminal-split-top-bottom").disabled = splitDisabled;
   query<HTMLButtonElement>("#terminal-clear").disabled = !active;
   query<HTMLButtonElement>("#terminal-restart").disabled =
     !active || active.state === "opening";
-  if (snapshot?.activeContactId === TERMINAL_CONTACT_ID) {
+  if (isTerminalContact()) {
+    const contactName = getActiveContact().displayName;
     query("#conversation-caption").textContent =
-      paneCount > 1 ? `WSL 终端会话 · ${paneCount} 个窗格` : "WSL 终端会话";
+      paneCount > 1 ? `${contactName} · ${paneCount} 个窗格` : `${contactName}会话`;
   }
 }
 
 function updateTerminalConnectionStatus(): void {
   if (!snapshot?.activeContactId || !isTerminalContact()) return;
-  const pane = activeTerminalPane();
+  const workspace = terminalWorkspace();
+  const pane = activeTerminalPane(workspace);
   if (!pane) {
     query("#connection-status").textContent = "正在启动 WSL 终端...";
     updateTypingStatus();
     return;
   }
-  const label = `WSL 终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`;
+  const contactName = getActiveContact().displayName;
+  const label = workspace && workspace.panes.size > 1
+    ? `${contactName} · 窗格 ${terminalPanePosition(pane.id, workspace)}/${workspace.panes.size}`
+    : contactName;
   const descriptions: Record<TerminalPaneState, string> = {
     opening: "正在连接 WSL PTY...",
     connected: "WSL PTY 已连接 · 支持 Codex 流式输出",
@@ -483,12 +548,15 @@ function updateTerminalConnectionStatus(): void {
 }
 
 function setActiveTerminalPane(pane: TerminalPaneRuntime, focus = false): void {
-  if (pane.disposed || terminalPanes.get(pane.id) !== pane) return;
-  activeTerminalPaneId = pane.id;
-  terminalPanes.forEach(updateTerminalPaneVisual);
-  updateTerminalToolbarState();
-  updateTerminalConnectionStatus();
-  updateSendState();
+  const { workspace } = pane;
+  if (pane.disposed || workspace.panes.get(pane.id) !== pane) return;
+  workspace.activePaneId = pane.id;
+  workspace.panes.forEach(updateTerminalPaneVisual);
+  if (snapshot?.activeContactId === workspace.contactId) {
+    updateTerminalToolbarState();
+    updateTerminalConnectionStatus();
+    updateSendState();
+  }
   if (focus) pane.terminal.focus();
 }
 
@@ -507,6 +575,7 @@ function setSplitElementRatio(
 
 function updateSplitRatioFromPointer(
   event: PointerEvent,
+  workspace: TerminalWorkspace,
   node: Extract<TerminalLayoutNode, { kind: "split" }>,
   container: HTMLElement,
   first: HTMLElement,
@@ -528,12 +597,15 @@ function updateSplitRatioFromPointer(
     Math.min(1 - minimumRatio, (pointer - dividerSize / 2) / available),
   );
   setSplitElementRatio(node, first, second, divider, ratio);
-  scheduleTerminalFit();
+  scheduleTerminalFit(workspace);
 }
 
-function renderTerminalLayoutNode(node: TerminalLayoutNode): HTMLElement {
+function renderTerminalLayoutNode(
+  node: TerminalLayoutNode,
+  workspace: TerminalWorkspace,
+): HTMLElement {
   if (node.kind === "pane") {
-    const pane = terminalPanes.get(node.paneId);
+    const pane = workspace.panes.get(node.paneId);
     if (!pane) throw new Error(`Missing terminal pane: ${node.paneId}`);
     pane.element.style.flex = "";
     return pane.element;
@@ -541,8 +613,8 @@ function renderTerminalLayoutNode(node: TerminalLayoutNode): HTMLElement {
 
   const container = document.createElement("div");
   container.className = `terminal-split terminal-split--${node.direction}`;
-  const first = renderTerminalLayoutNode(node.first);
-  const second = renderTerminalLayoutNode(node.second);
+  const first = renderTerminalLayoutNode(node.first, workspace);
+  const second = renderTerminalLayoutNode(node.second, workspace);
   const divider = document.createElement("div");
   divider.className = `terminal-divider terminal-divider--${node.direction}`;
   divider.tabIndex = 0;
@@ -566,14 +638,22 @@ function renderTerminalLayoutNode(node: TerminalLayoutNode): HTMLElement {
     divider.classList.add("is-dragging");
     divider.setPointerCapture(event.pointerId);
     const move = (moveEvent: PointerEvent) => {
-      updateSplitRatioFromPointer(moveEvent, node, container, first, second, divider);
+      updateSplitRatioFromPointer(
+        moveEvent,
+        workspace,
+        node,
+        container,
+        first,
+        second,
+        divider,
+      );
     };
     const finish = () => {
       divider.classList.remove("is-dragging");
       divider.removeEventListener("pointermove", move);
       divider.removeEventListener("pointerup", finish);
       divider.removeEventListener("pointercancel", finish);
-      scheduleTerminalFit();
+      scheduleTerminalFit(workspace);
     };
     divider.addEventListener("pointermove", move);
     divider.addEventListener("pointerup", finish);
@@ -590,20 +670,23 @@ function renderTerminalLayoutNode(node: TerminalLayoutNode): HTMLElement {
     else return;
     event.preventDefault();
     setSplitElementRatio(node, first, second, divider, ratio);
-    scheduleTerminalFit();
+    scheduleTerminalFit(workspace);
   });
 
   container.append(first, divider, second);
   return container;
 }
 
-function renderTerminalLayout(): void {
-  const ids = terminalPaneIds();
+function renderTerminalLayout(workspace: TerminalWorkspace): void {
+  if (snapshot?.activeContactId !== workspace.contactId) return;
+  const ids = terminalPaneIds(workspace.layout);
   terminalHost.classList.toggle("is-split", ids.length > 1);
-  if (terminalLayout) terminalHost.replaceChildren(renderTerminalLayoutNode(terminalLayout));
+  if (workspace.layout) {
+    terminalHost.replaceChildren(renderTerminalLayoutNode(workspace.layout, workspace));
+  }
   else terminalHost.replaceChildren();
   ids.forEach((paneId, index) => {
-    const pane = terminalPanes.get(paneId);
+    const pane = workspace.panes.get(paneId);
     if (!pane) return;
     pane.title.textContent = `WSL 终端 ${index + 1}`;
     pane.element.setAttribute("aria-label", `WSL 终端窗格 ${index + 1}`);
@@ -611,7 +694,7 @@ function renderTerminalLayout(): void {
     updateTerminalPaneVisual(pane);
   });
   updateTerminalToolbarState();
-  scheduleTerminalFit();
+  scheduleTerminalFit(workspace);
 }
 
 function queuePanePtyWrite(pane: TerminalPaneRuntime, data: Uint8Array): void {
@@ -636,7 +719,12 @@ function queuePanePtyWrite(pane: TerminalPaneRuntime, data: Uint8Array): void {
 }
 
 function resizeTerminalPaneToFit(pane: TerminalPaneRuntime): void {
-  if (pane.disposed || !pane.mounted || terminalHost.hidden) return;
+  if (
+    pane.disposed ||
+    !pane.mounted ||
+    terminalHost.hidden ||
+    snapshot?.activeContactId !== pane.workspace.contactId
+  ) return;
   if (pane.surface.clientWidth < 2 || pane.surface.clientHeight < 2) return;
   try {
     pane.fit.fit();
@@ -645,15 +733,16 @@ function resizeTerminalPaneToFit(pane: TerminalPaneRuntime): void {
   }
 }
 
-function fitAllTerminalPanes(): void {
-  terminalPanes.forEach(resizeTerminalPaneToFit);
+function fitAllTerminalPanes(workspace = terminalWorkspace()): void {
+  if (!workspace || snapshot?.activeContactId !== workspace.contactId) return;
+  workspace.panes.forEach(resizeTerminalPaneToFit);
 }
 
-function scheduleTerminalFit(): void {
-  if (terminalFitFrame !== null) return;
-  terminalFitFrame = requestAnimationFrame(() => {
-    terminalFitFrame = null;
-    fitAllTerminalPanes();
+function scheduleTerminalFit(workspace = terminalWorkspace()): void {
+  if (!workspace || workspace.fitFrame !== null) return;
+  workspace.fitFrame = requestAnimationFrame(() => {
+    workspace.fitFrame = null;
+    fitAllTerminalPanes(workspace);
   });
 }
 
@@ -703,8 +792,10 @@ function handleTerminalPaneExit(
     : `\r\n\r\n[终端已退出，exit ${exit.exitCode ?? "?"}${exit.signal ? ` · ${exit.signal}` : ""}]\r\n`;
   pane.terminal.write(notice);
   updateTerminalPaneVisual(pane);
-  updateTerminalToolbarState();
-  updateTerminalConnectionStatus();
+  if (snapshot?.activeContactId === pane.workspace.contactId) {
+    updateTerminalToolbarState();
+    updateTerminalConnectionStatus();
+  }
 }
 
 async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
@@ -713,8 +804,10 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
   const generation = ++pane.generation;
   pane.state = "opening";
   updateTerminalPaneVisual(pane);
-  updateTerminalToolbarState();
-  updateTerminalConnectionStatus();
+  if (snapshot?.activeContactId === pane.workspace.contactId) {
+    updateTerminalToolbarState();
+    updateTerminalConnectionStatus();
+  }
   resizeTerminalPaneToFit(pane);
 
   let returnedSessionId: number | null = null;
@@ -730,7 +823,7 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
         if (
           !pane.disposed &&
           pane.generation === generation &&
-          terminalPanes.get(pane.id) === pane
+          pane.workspace.panes.get(pane.id) === pane
         ) pane.terminal.write(ptyBytes(data));
       },
       (exit) => {
@@ -742,7 +835,7 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
     if (
       pane.disposed ||
       pane.generation !== generation ||
-      terminalPanes.get(pane.id) !== pane
+      pane.workspace.panes.get(pane.id) !== pane
     ) {
       await backend.closePty(sessionId);
       return;
@@ -752,14 +845,16 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
     updateTerminalPaneVisual(pane);
     resizeTerminalPaneToFit(pane);
     if (earlyExit) handleTerminalPaneExit(pane, generation, earlyExit);
-    updateTerminalToolbarState();
-    updateTerminalConnectionStatus();
+    if (snapshot?.activeContactId === pane.workspace.contactId) {
+      updateTerminalToolbarState();
+      updateTerminalConnectionStatus();
+    }
   })()
     .catch((error) => {
       if (
         pane.disposed ||
         pane.generation !== generation ||
-        terminalPanes.get(pane.id) !== pane
+        pane.workspace.panes.get(pane.id) !== pane
       ) return;
       pane.state = "error";
       pane.terminal.write(
@@ -767,8 +862,10 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
       );
       updateTerminalPaneVisual(pane);
       showToast(error instanceof Error ? error.message : "无法启动终端");
-      updateTerminalToolbarState();
-      updateTerminalConnectionStatus();
+      if (snapshot?.activeContactId === pane.workspace.contactId) {
+        updateTerminalToolbarState();
+        updateTerminalConnectionStatus();
+      }
     })
     .finally(() => {
       if (pane.openPromise === opening) pane.openPromise = null;
@@ -788,7 +885,7 @@ function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): vo
         continue;
       }
       void backend
-        .executeTerminal(command)
+        .executeTerminal(command, pane.workspace.contactId)
         .then((execution) => {
           if (!pane.disposed) {
             pane.terminal.write(
@@ -815,8 +912,8 @@ function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): vo
   }
 }
 
-function createTerminalPane(): TerminalPaneRuntime {
-  const id = nextTerminalPaneId++;
+function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
+  const id = workspace.nextPaneId++;
   const element = document.createElement("section");
   element.className = "terminal-pane";
   element.dataset.paneId = String(id);
@@ -885,6 +982,7 @@ function createTerminalPane(): TerminalPaneRuntime {
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   const pane: TerminalPaneRuntime = {
+    workspace,
     id,
     element,
     surface,
@@ -921,7 +1019,7 @@ function createTerminalPane(): TerminalPaneRuntime {
   });
   closeButton.addEventListener("click", (event) => {
     event.stopPropagation();
-    void closeTerminalPane(pane.id);
+    void closeTerminalPane(pane);
   });
   return pane;
 }
@@ -947,7 +1045,7 @@ function mountTerminalPane(pane: TerminalPaneRuntime): void {
       schedulePanePtyResize(pane, rows, cols);
     }),
   );
-  pane.resizeObserver = new ResizeObserver(scheduleTerminalFit);
+  pane.resizeObserver = new ResizeObserver(() => scheduleTerminalFit(pane.workspace));
   pane.resizeObserver.observe(pane.surface);
   if (!isTauriRuntime()) {
     pane.terminal.write("Retro Messenger WSL 终端预览\r\n输入 help 查看模拟 Linux 命令。\r\nwsl$ ");
@@ -955,52 +1053,60 @@ function mountTerminalPane(pane: TerminalPaneRuntime): void {
   resizeTerminalPaneToFit(pane);
 }
 
-function ensureTerminal(focus = true): TerminalPaneRuntime | null {
+function ensureTerminal(
+  focus = true,
+  contactId = snapshot?.activeContactId,
+): TerminalPaneRuntime | null {
+  const workspace = terminalWorkspace(contactId, true);
+  if (!workspace || snapshot?.activeContactId !== workspace.contactId) return null;
   terminalHost.hidden = false;
   transcript.hidden = true;
-  if (!terminalLayout) {
-    const pane = createTerminalPane();
-    terminalPanes.set(pane.id, pane);
-    terminalLayout = { kind: "pane", paneId: pane.id };
-    activeTerminalPaneId = pane.id;
-    renderTerminalLayout();
+  if (!workspace.layout) {
+    const pane = createTerminalPane(workspace);
+    workspace.panes.set(pane.id, pane);
+    workspace.layout = { kind: "pane", paneId: pane.id };
+    workspace.activePaneId = pane.id;
+    renderTerminalLayout(workspace);
     mountTerminalPane(pane);
+  } else {
+    renderTerminalLayout(workspace);
   }
-  fitAllTerminalPanes();
-  terminalPanes.forEach((pane) => {
+  fitAllTerminalPanes(workspace);
+  workspace.panes.forEach((pane) => {
     if (isTauriRuntime() && !pane.sessionId && !pane.openPromise) {
       void openTerminalPane(pane);
     }
   });
-  const active = activeTerminalPane();
+  const active = activeTerminalPane(workspace);
   if (focus) active?.terminal.focus();
-  scheduleTerminalFit();
+  scheduleTerminalFit(workspace);
   return active;
 }
 
 async function splitActiveTerminal(direction: TerminalSplitDirection): Promise<void> {
+  const workspace = terminalWorkspace();
   const active = ensureTerminal(false);
-  if (!active || !terminalLayout) return;
-  if (terminalPanes.size >= MAX_TERMINAL_PANES) {
+  if (!workspace || !active || !workspace.layout) return;
+  if (workspace.panes.size >= MAX_TERMINAL_PANES) {
     showToast(`最多可同时打开 ${MAX_TERMINAL_PANES} 个终端窗格`);
     return;
   }
-  const pane = createTerminalPane();
-  terminalPanes.set(pane.id, pane);
-  terminalLayout = replaceTerminalPaneNode(terminalLayout, active.id, {
+  const pane = createTerminalPane(workspace);
+  workspace.panes.set(pane.id, pane);
+  workspace.layout = replaceTerminalPaneNode(workspace.layout, active.id, {
     kind: "split",
     direction,
     ratio: 0.5,
     first: { kind: "pane", paneId: active.id },
     second: { kind: "pane", paneId: pane.id },
   });
-  activeTerminalPaneId = pane.id;
-  renderTerminalLayout();
+  workspace.activePaneId = pane.id;
+  renderTerminalLayout(workspace);
   mountTerminalPane(pane);
   setActiveTerminalPane(pane, true);
-  fitAllTerminalPanes();
+  fitAllTerminalPanes(workspace);
   if (isTauriRuntime()) await openTerminalPane(pane);
-  scheduleTerminalFit();
+  scheduleTerminalFit(workspace);
 }
 
 async function disposeTerminalPane(
@@ -1025,30 +1131,30 @@ async function disposeTerminalPane(
   if (sessionId) await backend.closePty(sessionId);
 }
 
-async function closeTerminalPane(paneId: number): Promise<void> {
-  if (terminalPanes.size <= 1 || !terminalLayout) return;
-  const pane = terminalPanes.get(paneId);
-  if (!pane) return;
-  const previousIds = terminalPaneIds();
-  const previousIndex = previousIds.indexOf(paneId);
+async function closeTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
+  const { workspace } = pane;
+  if (workspace.panes.size <= 1 || !workspace.layout) return;
+  if (workspace.panes.get(pane.id) !== pane) return;
+  const previousIds = terminalPaneIds(workspace.layout);
+  const previousIndex = previousIds.indexOf(pane.id);
   pane.disposed = true;
   pane.generation += 1;
-  terminalPanes.delete(paneId);
-  terminalLayout = removeTerminalPaneNode(terminalLayout, paneId);
-  const remainingIds = terminalPaneIds();
-  if (activeTerminalPaneId === paneId) {
-    activeTerminalPaneId =
+  workspace.panes.delete(pane.id);
+  workspace.layout = removeTerminalPaneNode(workspace.layout, pane.id);
+  const remainingIds = terminalPaneIds(workspace.layout);
+  if (workspace.activePaneId === pane.id) {
+    workspace.activePaneId =
       remainingIds[Math.min(Math.max(previousIndex, 0), remainingIds.length - 1)] ?? null;
   }
-  renderTerminalLayout();
+  renderTerminalLayout(workspace);
   await disposeTerminalPane(pane, true);
-  const active = activeTerminalPane();
+  const active = activeTerminalPane(workspace);
   if (active) setActiveTerminalPane(active, true);
-  scheduleTerminalFit();
+  scheduleTerminalFit(workspace);
 }
 
 async function restartTerminalPaneNow(pane: TerminalPaneRuntime): Promise<void> {
-  if (pane.disposed || terminalPanes.get(pane.id) !== pane) return;
+  if (pane.disposed || pane.workspace.panes.get(pane.id) !== pane) return;
   pane.generation += 1;
   const pendingOpen = pane.openPromise;
   pane.writeQueue = Promise.resolve();
@@ -1073,8 +1179,10 @@ async function restartTerminalPaneNow(pane: TerminalPaneRuntime): Promise<void> 
     pane.terminal.write("wsl$ ");
   }
   updateTerminalPaneVisual(pane);
-  updateTerminalToolbarState();
-  updateTerminalConnectionStatus();
+  if (snapshot?.activeContactId === pane.workspace.contactId) {
+    updateTerminalToolbarState();
+    updateTerminalConnectionStatus();
+  }
   pane.terminal.focus();
 }
 
@@ -1151,7 +1259,7 @@ function contactRow(contact: Contact): HTMLButtonElement {
   const button = document.createElement("button");
   button.type = "button";
   button.className = `contact-row ${contact.presence}`;
-  if (contact.id === TERMINAL_CONTACT_ID) button.classList.add("terminal-contact");
+  if (isTerminalContact(contact.id)) button.classList.add("terminal-contact");
   if (contact.id === snapshot.activeContactId) button.classList.add("selected");
   button.dataset.contactId = contact.id;
   button.setAttribute("role", "option");
@@ -1191,6 +1299,12 @@ function contactRow(contact: Contact): HTMLButtonElement {
   time.textContent = formatTime(contact.lastMessageAt);
   button.append(avatar, copy, time);
   button.addEventListener("click", () => void selectContact(contact.id));
+  if (isTerminalContact(contact.id)) {
+    button.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      openRenameTerminal(contact.id);
+    });
+  }
   return button;
 }
 
@@ -1234,9 +1348,24 @@ function renderContacts(): void {
       else collapsedGroups.add(groupName);
       renderContacts();
     });
-    contactList.append(groupButton);
+    if (groupName === "工具") {
+      const groupRow = document.createElement("div");
+      groupRow.className = "group-header-row";
+      const addTerminalButton = document.createElement("button");
+      addTerminalButton.type = "button";
+      addTerminalButton.className = "group-add-terminal";
+      addTerminalButton.title = "新建独立 WSL 终端";
+      addTerminalButton.setAttribute("aria-label", "新建独立 WSL 终端");
+      addTerminalButton.innerHTML = icon("Plus", 13);
+      addTerminalButton.addEventListener("click", () => void addTerminalContact());
+      groupRow.append(groupButton, addTerminalButton);
+      contactList.append(groupRow);
+    } else {
+      contactList.append(groupButton);
+    }
     if (!collapsed) items.forEach((contact) => contactList.append(contactRow(contact)));
   });
+  refreshIcons();
 }
 
 function renderChatHeader(): void {
@@ -1349,10 +1478,14 @@ function renderMessages(forceBottom = false): void {
 function updateTypingStatus(): void {
   const status = query("#typing-status");
   if (isTerminalContact()) {
-    const pane = activeTerminalPane();
+    const workspace = terminalWorkspace();
+    const pane = activeTerminalPane(workspace);
+    const contactName = getActiveContact().displayName;
     const label = pane
-      ? `WSL 终端 ${terminalPanePosition(pane.id)}/${terminalPanes.size}`
-      : "WSL 终端";
+      ? workspace && workspace.panes.size > 1
+        ? `${contactName} · 窗格 ${terminalPanePosition(pane.id, workspace)}/${workspace.panes.size}`
+        : contactName
+      : contactName;
     status.textContent = pane?.state === "connected"
       ? `${label} · WSL PTY 已连接`
       : `${label} · 未连接`;
@@ -1372,9 +1505,10 @@ function updateTypingStatus(): void {
 function updateSendState(): void {
   const hasText = messageInput.value.trim().length > 0;
   if (isTerminalContact()) {
-    const pane = activeTerminalPane();
-    const paneLabel = pane && terminalPanes.size > 1
-      ? ` · 发送到 WSL 终端 ${terminalPanePosition(pane.id)}`
+    const workspace = terminalWorkspace();
+    const pane = activeTerminalPane(workspace);
+    const paneLabel = pane && workspace && workspace.panes.size > 1
+      ? ` · 发送到窗格 ${terminalPanePosition(pane.id, workspace)}`
       : "";
     sendButton.disabled = !hasText;
     query("#send-tip").textContent = hasText
@@ -1392,6 +1526,79 @@ function replaceContact(updated: Contact): void {
   const index = snapshot.contacts.findIndex((contact) => contact.id === updated.id);
   if (index >= 0) snapshot.contacts[index] = updated;
   if (updated.id === snapshot.currentUser.id) snapshot.currentUser = updated;
+}
+
+function openRenameTerminal(contactId = snapshot.activeContactId): void {
+  if (!isTerminalContact(contactId)) return;
+  const contact = snapshot.contacts.find((item) => item.id === contactId);
+  if (!contact) return;
+  renamingTerminalId = contactId;
+  terminalNameInput.value = contact.displayName;
+  terminalRenameError.textContent = "";
+  popupMenu.hidden = true;
+  terminalRenameDialog.hidden = false;
+  requestAnimationFrame(() => {
+    terminalNameInput.focus();
+    terminalNameInput.select();
+  });
+}
+
+function closeRenameTerminal(restoreFocus = true): void {
+  terminalRenameDialog.hidden = true;
+  terminalRenameError.textContent = "";
+  renamingTerminalId = null;
+  if (restoreFocus && isTerminalContact()) {
+    query<HTMLButtonElement>("#terminal-rename").focus();
+  }
+}
+
+async function renameTerminal(): Promise<void> {
+  const contactId = renamingTerminalId;
+  if (!contactId) return;
+  const displayName = terminalNameInput.value.trim();
+  if (!displayName) {
+    terminalRenameError.textContent = "终端名称不能为空";
+    terminalNameInput.focus();
+    return;
+  }
+  if ([...displayName].length > 24) {
+    terminalRenameError.textContent = "终端名称不能超过 24 个字符";
+    terminalNameInput.focus();
+    return;
+  }
+
+  try {
+    const updated = await backend.renameTerminalContact(contactId, displayName);
+    replaceContact(updated);
+    closeRenameTerminal(false);
+    renderContacts();
+    if (snapshot.activeContactId === contactId) {
+      renderChatHeader();
+      updateTerminalConnectionStatus();
+      query<HTMLButtonElement>("#terminal-rename").focus();
+    }
+    showToast(`已重命名为“${updated.displayName}”`);
+  } catch (error) {
+    terminalRenameError.textContent = error instanceof Error ? error.message : "无法重命名终端";
+    terminalNameInput.focus();
+  }
+}
+
+async function addTerminalContact(): Promise<void> {
+  try {
+    const contact = await backend.createTerminalContact();
+    if (!snapshot.contacts.some((item) => item.id === contact.id)) {
+      snapshot.contacts.push(contact);
+    }
+    filterText = "";
+    query<HTMLInputElement>("#contact-search").value = "";
+    collapsedGroups.delete("工具");
+    if (activeTab !== "friends") setTab("friends");
+    else renderContacts();
+    await selectContact(contact.id);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "无法新建 WSL 终端");
+  }
 }
 
 async function selectContact(contactId: string): Promise<void> {
@@ -1771,6 +1978,7 @@ function bindEvents(): void {
       showToast("已定位到今天的第一条记录");
     }
   });
+  query("#terminal-rename").addEventListener("click", () => openRenameTerminal());
   query("#terminal-clear").addEventListener("click", () => {
     const pane = activeTerminalPane();
     pane?.terminal.clear();
@@ -1831,6 +2039,15 @@ function bindEvents(): void {
 
   query("#dialog-close").addEventListener("click", closeAbout);
   query("#dialog-ok").addEventListener("click", closeAbout);
+  query("#terminal-rename-close").addEventListener("click", () => closeRenameTerminal());
+  query("#terminal-rename-cancel").addEventListener("click", () => closeRenameTerminal());
+  query<HTMLFormElement>("#terminal-rename-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    void renameTerminal();
+  });
+  terminalRenameDialog.addEventListener("click", (event) => {
+    if (event.target === terminalRenameDialog) closeRenameTerminal();
+  });
   aboutDialog.addEventListener("click", (event) => {
     if (event.target === aboutDialog) closeAbout();
   });
@@ -1843,6 +2060,7 @@ function bindEvents(): void {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       popupMenu.hidden = true;
+      if (!terminalRenameDialog.hidden) closeRenameTerminal();
       closeAbout();
     }
   });

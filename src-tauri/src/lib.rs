@@ -304,6 +304,50 @@ impl ChatStore {
             .collect())
     }
 
+    fn create_terminal_contact(&mut self) -> Contact {
+        let mut ordinal = 2_u32;
+        let (id, display_name) = loop {
+            let id = format!("terminal-{ordinal}");
+            if self.contacts.iter().all(|contact| contact.id != id) {
+                break (id, format!("WSL 终端 {ordinal}"));
+            }
+            ordinal = ordinal.saturating_add(1);
+        };
+        let contact = Contact {
+            id: id.clone(),
+            display_name,
+            account: format!("WSL SHELL #{ordinal}"),
+            avatar_seed: "terminal".into(),
+            presence: "online".into(),
+            status_message: "独立 WSL2 终端会话".into(),
+            group: "工具".into(),
+            unread_count: 0,
+            last_message: "等待启动 Linux shell。".into(),
+            last_message_at: now_ms(),
+        };
+        self.contacts.push(contact.clone());
+        self.active_contact_id = id;
+        contact
+    }
+
+    fn rename_terminal_contact(
+        &mut self,
+        contact_id: &str,
+        display_name: &str,
+    ) -> Result<Contact, String> {
+        if !is_terminal_contact_id(contact_id) {
+            return Err("只能重命名 WSL 终端".into());
+        }
+        let display_name = normalize_terminal_name(display_name)?;
+        let contact = self
+            .contacts
+            .iter_mut()
+            .find(|contact| contact.id == contact_id)
+            .ok_or_else(|| format!("找不到终端：{contact_id}"))?;
+        contact.display_name = display_name;
+        Ok(contact.clone())
+    }
+
     fn send_message(&mut self, contact_id: &str, text: &str) -> Result<Message, String> {
         self.contact(contact_id)?;
         let text = normalize_message(text)?;
@@ -492,6 +536,30 @@ fn normalize_message(input: &str) -> Result<String, String> {
         .any(|character| character.is_control() && character != '\n' && character != '\t')
     {
         return Err("消息包含不支持的控制字符".into());
+    }
+    Ok(trimmed.into())
+}
+
+fn is_terminal_contact_id(contact_id: &str) -> bool {
+    contact_id == TERMINAL_ID
+        || contact_id
+            .strip_prefix("terminal-")
+            .map(|suffix| {
+                !suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit())
+            })
+            .unwrap_or(false)
+}
+
+fn normalize_terminal_name(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("终端名称不能为空".into());
+    }
+    if trimmed.chars().count() > 24 {
+        return Err("终端名称不能超过 24 个字符".into());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("终端名称包含不支持的控制字符".into());
     }
     Ok(trimmed.into())
 }
@@ -761,6 +829,22 @@ fn generate_reply(
 }
 
 #[tauri::command]
+fn create_terminal_contact(state: State<'_, ManagedChatState>) -> Result<Contact, String> {
+    let mut store = state.lock().map_err(|_| "聊天状态暂时不可用".to_string())?;
+    Ok(store.create_terminal_contact())
+}
+
+#[tauri::command]
+fn rename_terminal_contact(
+    contact_id: String,
+    display_name: String,
+    state: State<'_, ManagedChatState>,
+) -> Result<Contact, String> {
+    let mut store = state.lock().map_err(|_| "聊天状态暂时不可用".to_string())?;
+    store.rename_terminal_contact(&contact_id, &display_name)
+}
+
+#[tauri::command]
 fn execute_terminal(
     command: String,
     state: State<'_, ManagedChatState>,
@@ -1010,6 +1094,8 @@ pub fn run() {
             get_conversation,
             send_message,
             generate_reply,
+            create_terminal_contact,
+            rename_terminal_contact,
             execute_terminal,
             pty_open,
             pty_write,
@@ -1081,6 +1167,32 @@ mod tests {
             execution.output_message.text
         );
         assert!(store.execute_terminal(" \n ").is_err());
+    }
+
+    #[test]
+    fn terminal_contacts_are_independent_and_numbered() {
+        let mut store = ChatStore::demo();
+        let second = store.create_terminal_contact();
+        let third = store.create_terminal_contact();
+
+        assert_eq!(second.id, "terminal-2");
+        assert_eq!(second.display_name, "WSL 终端 2");
+        assert_eq!(third.id, "terminal-3");
+        assert_eq!(third.group, "工具");
+        assert_eq!(store.active_contact_id, third.id);
+        assert!(store.conversation(&second.id).unwrap().is_empty());
+        assert_eq!(store.snapshot().contacts.len(), 8);
+
+        let renamed = store
+            .rename_terminal_contact(&second.id, "  项目终端  ")
+            .unwrap();
+        assert_eq!(renamed.display_name, "项目终端");
+        assert_eq!(store.contact(&second.id).unwrap().display_name, "项目终端");
+        assert!(store.rename_terminal_contact("ache", "错误名称").is_err());
+        assert!(store.rename_terminal_contact(&third.id, "   ").is_err());
+        assert!(store
+            .rename_terminal_contact(&third.id, &"终".repeat(25))
+            .is_err());
     }
 
     #[test]

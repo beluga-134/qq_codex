@@ -214,6 +214,20 @@ function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
+function isTerminalContactId(contactId: string): boolean {
+  return contactId === TERMINAL_CONTACT_ID || /^terminal-\d+$/.test(contactId);
+}
+
+function normalizeTerminalName(displayName: string): string {
+  const normalized = displayName.trim();
+  if (!normalized) throw new Error("终端名称不能为空");
+  if ([...normalized].length > 24) throw new Error("终端名称不能超过 24 个字符");
+  if ([...normalized].some((character) => /[\u0000-\u001f\u007f]/.test(character))) {
+    throw new Error("终端名称包含不支持的控制字符");
+  }
+  return normalized;
+}
+
 function mockReply(contact: Contact, lastText: string): string {
   if (contact.id === "service") {
     return "您好，这里是 OICQ 服务台。当前线路畅通，消息已成功送达。";
@@ -231,12 +245,17 @@ function mockReply(contact: Contact, lastText: string): string {
   return replies[(mockMessageId + contact.id.length) % replies.length] ?? replies[0];
 }
 
-function mockTerminalExecution(command: string): TerminalExecution {
+function mockTerminalExecution(
+  command: string,
+  contactId = TERMINAL_CONTACT_ID,
+): TerminalExecution {
   const mockProjectRoot = "/mnt/e/qq_codex/qq_codex";
+  const terminalContact = mockContacts.find((contact) => contact.id === contactId);
+  if (!terminalContact) throw new Error("终端不存在");
   const normalized = command.trim();
   const commandMessage: Message = {
     id: mockMessageId++,
-    contactId: TERMINAL_CONTACT_ID,
+    contactId,
     senderId: mockUser.id,
     senderName: mockUser.displayName,
     text: normalized,
@@ -263,23 +282,20 @@ function mockTerminalExecution(command: string): TerminalExecution {
   }
   const outputMessage: Message = {
     id: mockMessageId++,
-    contactId: TERMINAL_CONTACT_ID,
-    senderId: TERMINAL_CONTACT_ID,
-    senderName: "WSL 终端",
+    contactId,
+    senderId: contactId,
+    senderName: terminalContact.displayName,
     text: output || "(命令执行完成，没有输出)",
     sentAt: Date.now(),
     outgoing: false,
     read: true,
   };
-  const conversation = mockMessages.get(TERMINAL_CONTACT_ID) ?? [];
+  const conversation = mockMessages.get(contactId) ?? [];
   conversation.push(commandMessage, outputMessage);
-  mockMessages.set(TERMINAL_CONTACT_ID, conversation);
-  mockActiveContact = TERMINAL_CONTACT_ID;
-  const terminal = mockContacts.find((item) => item.id === TERMINAL_CONTACT_ID);
-  if (terminal) {
-    terminal.lastMessage = outputMessage.text;
-    terminal.lastMessageAt = outputMessage.sentAt;
-  }
+  mockMessages.set(contactId, conversation);
+  mockActiveContact = contactId;
+  terminalContact.lastMessage = outputMessage.text;
+  terminalContact.lastMessageAt = outputMessage.sentAt;
   return {
     commandMessage: clone(commandMessage),
     outputMessage: clone(outputMessage),
@@ -366,10 +382,51 @@ export const backend = {
     return clone(contact);
   },
 
-  async executeTerminal(command: string): Promise<TerminalExecution> {
+  async createTerminalContact(): Promise<Contact> {
+    if (isTauri()) return invoke<Contact>("create_terminal_contact");
+    let ordinal = 2;
+    while (mockContacts.some((contact) => contact.id === `terminal-${ordinal}`)) {
+      ordinal += 1;
+    }
+    const contact: Contact = {
+      id: `terminal-${ordinal}`,
+      displayName: `WSL 终端 ${ordinal}`,
+      account: `WSL SHELL #${ordinal}`,
+      avatarSeed: "terminal",
+      presence: "online",
+      statusMessage: "独立 WSL2 终端会话",
+      group: "工具",
+      unreadCount: 0,
+      lastMessage: "等待启动 Linux shell。",
+      lastMessageAt: Date.now(),
+    };
+    mockContacts.push(contact);
+    mockMessages.set(contact.id, []);
+    mockActiveContact = contact.id;
+    return clone(contact);
+  },
+
+  async renameTerminalContact(
+    contactId: string,
+    displayName: string,
+  ): Promise<Contact> {
+    if (isTauri()) {
+      return invoke<Contact>("rename_terminal_contact", { contactId, displayName });
+    }
+    if (!isTerminalContactId(contactId)) throw new Error("只能重命名 WSL 终端");
+    const contact = mockContacts.find((item) => item.id === contactId);
+    if (!contact) throw new Error("终端不存在");
+    contact.displayName = normalizeTerminalName(displayName);
+    return clone(contact);
+  },
+
+  async executeTerminal(
+    command: string,
+    contactId = TERMINAL_CONTACT_ID,
+  ): Promise<TerminalExecution> {
     if (isTauri()) return invoke<TerminalExecution>("execute_terminal", { command });
     if (!command.trim()) throw new Error("命令不能为空");
-    return mockTerminalExecution(command);
+    return mockTerminalExecution(command, contactId);
   },
 
   async openPty(
