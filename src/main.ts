@@ -37,7 +37,10 @@ import {
   VolumeX,
   X,
   Zap,
+  ZoomIn,
+  ZoomOut,
 } from "lucide";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Terminal as XtermTerminal, type IDisposable } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -123,6 +126,8 @@ const iconSet = {
   VolumeX,
   X,
   Zap,
+  ZoomIn,
+  ZoomOut,
 };
 
 type RosterTab = "friends" | "groups" | "recent";
@@ -193,6 +198,12 @@ let messageCompositionResetTimer: number | null = null;
 let lastWindowMaximized: boolean | null = null;
 let windowStateSyncScheduled = false;
 let renamingTerminalId: string | null = null;
+const ZOOM_STORAGE_KEY = "ociq.ui.zoom";
+const AVATAR_STORAGE_KEY = "ociq.profile.avatar";
+const ZOOM_LEVELS = [0.75, 0.9, 1, 1.1, 1.25, 1.5];
+let currentZoom = readStoredZoom();
+let customAvatar = readStoredAvatar();
+let pendingAvatar: string | null = customAvatar;
 const terminalWorkspaces = new Map<string, TerminalWorkspace>();
 const MAX_TERMINAL_PANES = 4;
 const collapsedGroups = new Set<string>();
@@ -203,11 +214,33 @@ function icon(name: keyof typeof iconSet, size = 16): string {
   return `<i data-lucide="${name}" data-size="${size}" aria-hidden="true"></i>`;
 }
 
+function readStoredZoom(): number {
+  try {
+    const value = Number(localStorage.getItem(ZOOM_STORAGE_KEY));
+    return ZOOM_LEVELS.includes(value) ? value : 1;
+  } catch {
+    return 1;
+  }
+}
+
+function readStoredAvatar(): string | null {
+  try {
+    const value = localStorage.getItem(AVATAR_STORAGE_KEY);
+    return value?.startsWith("data:image/webp;base64,") ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function selfAvatarSource(): string {
+  return customAvatar ?? selfAvatar;
+}
+
 appRoot.innerHTML = `
   <main class="app-shell" id="app-shell">
     <header class="xp-titlebar" id="window-drag-region">
       <div class="window-title">
-        <img class="title-icon" src="${selfAvatar}" alt="" draggable="false" />
+        <img class="title-icon" id="title-avatar" src="${selfAvatarSource()}" alt="" draggable="false" />
         <span>OICQ 2003 - 即时消息</span>
       </div>
       <div class="window-controls" aria-label="窗口控制">
@@ -227,10 +260,12 @@ appRoot.innerHTML = `
     <div class="workspace">
       <aside class="roster-pane" aria-label="好友列表">
         <section class="self-profile">
-          <div class="avatar-frame avatar-large">
-            <img src="${selfAvatar}" alt="小鲸的头像" draggable="false" />
-            <span class="presence-dot online" aria-label="在线"></span>
-          </div>
+          <button class="self-avatar-button" id="self-avatar-button" type="button" title="更换头像" aria-label="更换头像">
+            <span class="avatar-frame avatar-large">
+              <img id="self-avatar" src="${selfAvatarSource()}" alt="小鲸的头像" draggable="false" />
+              <span class="presence-dot online" aria-label="在线"></span>
+            </span>
+          </button>
           <div class="self-copy">
             <button class="self-name" id="presence-trigger" aria-haspopup="menu">
               <span id="self-display-name">小鲸</span>
@@ -263,6 +298,10 @@ appRoot.innerHTML = `
           <span class="tool-separator"></span>
           <button class="tool-button" id="sound-toggle" title="关闭声音" aria-label="关闭声音">${icon("Volume2", 15)}</button>
           <button class="tool-button" id="settings-button" title="设置状态" aria-label="设置状态">${icon("Settings", 15)}</button>
+          <span class="tool-separator zoom-separator"></span>
+          <button class="tool-button" id="zoom-out" title="缩小页面" aria-label="缩小页面">${icon("ZoomOut", 15)}</button>
+          <button class="zoom-level" id="zoom-reset" title="恢复 100%" aria-label="当前缩放 ${Math.round(currentZoom * 100)}%，点击恢复 100%">${Math.round(currentZoom * 100)}%</button>
+          <button class="tool-button" id="zoom-in" title="放大页面" aria-label="放大页面">${icon("ZoomIn", 15)}</button>
         </div>
       </aside>
 
@@ -353,6 +392,25 @@ appRoot.innerHTML = `
 
     <div class="popup-menu" id="popup-menu" role="menu" hidden></div>
     <div class="toast" id="toast" role="status" hidden></div>
+    <div class="dialog-backdrop" id="avatar-dialog" hidden>
+      <section class="xp-dialog avatar-dialog" role="dialog" aria-modal="true" aria-labelledby="avatar-dialog-title">
+        <div class="dialog-titlebar"><span id="avatar-dialog-title">自定义头像</span><button type="button" id="avatar-dialog-close" aria-label="关闭">${icon("X", 12)}</button></div>
+        <div class="avatar-dialog-body">
+          <div class="avatar-preview-frame"><img id="avatar-preview" src="${selfAvatarSource()}" alt="头像预览" /></div>
+          <div class="avatar-picker-actions">
+            <button class="xp-button" type="button" id="avatar-choose">选择图片...</button>
+            <button class="xp-button" type="button" id="avatar-default">恢复默认</button>
+            <input id="avatar-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" hidden />
+            <p id="avatar-file-name">${customAvatar ? "自定义头像" : "默认头像"}</p>
+            <p class="dialog-field-error" id="avatar-error" role="alert"></p>
+          </div>
+        </div>
+        <div class="dialog-actions">
+          <button class="xp-button" type="button" id="avatar-cancel">取消</button>
+          <button class="xp-button default" type="button" id="avatar-save">保存</button>
+        </div>
+      </section>
+    </div>
     <div class="dialog-backdrop" id="terminal-rename-dialog" hidden>
       <section class="xp-dialog rename-terminal-dialog" role="dialog" aria-modal="true" aria-labelledby="terminal-rename-title">
         <form id="terminal-rename-form">
@@ -373,7 +431,7 @@ appRoot.innerHTML = `
       <section class="xp-dialog" role="dialog" aria-modal="true" aria-labelledby="about-title">
         <div class="dialog-titlebar"><span id="about-title">关于 OICQ 2003</span><button id="dialog-close" aria-label="关闭">${icon("X", 12)}</button></div>
         <div class="dialog-body">
-          <img src="${selfAvatar}" alt="OICQ 像素企鹅" />
+          <img id="about-avatar" src="${selfAvatarSource()}" alt="OICQ 用户头像" />
           <div><strong>OICQ 2003</strong><p>局域网即时通讯演示版</p><p>WebView2 GUI + WSL2 Terminal</p></div>
         </div>
         <div class="dialog-actions"><button class="xp-button default" id="dialog-ok">确定</button></div>
@@ -401,6 +459,10 @@ const terminalRenameDialog = query<HTMLDivElement>("#terminal-rename-dialog");
 const terminalNameInput = query<HTMLInputElement>("#terminal-name-input");
 const terminalRenameError = query<HTMLParagraphElement>("#terminal-rename-error");
 const aboutDialog = query<HTMLDivElement>("#about-dialog");
+const avatarDialog = query<HTMLDivElement>("#avatar-dialog");
+const avatarPreview = query<HTMLImageElement>("#avatar-preview");
+const avatarFileInput = query<HTMLInputElement>("#avatar-file-input");
+const avatarError = query<HTMLParagraphElement>("#avatar-error");
 
 function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -1202,6 +1264,7 @@ function getActiveContact(): Contact {
 }
 
 function avatarFor(contact: Contact): string {
+  if (contact.avatarSeed === "self") return selfAvatarSource();
   return avatars[contact.avatarSeed] ?? serviceAvatar;
 }
 
@@ -1229,6 +1292,131 @@ function showToast(text: string): void {
   window.setTimeout(() => {
     toast.hidden = true;
   }, 2200);
+}
+
+function updateZoomControls(): void {
+  const index = ZOOM_LEVELS.indexOf(currentZoom);
+  const percentage = Math.round(currentZoom * 100);
+  const reset = query<HTMLButtonElement>("#zoom-reset");
+  reset.textContent = `${percentage}%`;
+  reset.setAttribute("aria-label", `当前缩放 ${percentage}%，点击恢复 100%`);
+  query<HTMLButtonElement>("#zoom-out").disabled = index <= 0;
+  query<HTMLButtonElement>("#zoom-in").disabled = index >= ZOOM_LEVELS.length - 1;
+}
+
+async function applyPageZoom(scale: number, announce = true): Promise<void> {
+  currentZoom = ZOOM_LEVELS.includes(scale) ? scale : 1;
+  updateZoomControls();
+  try {
+    localStorage.setItem(ZOOM_STORAGE_KEY, String(currentZoom));
+  } catch {
+    if (announce) showToast("无法保存缩放设置");
+  }
+
+  try {
+    if (isTauriRuntime()) {
+      await getCurrentWebview().setZoom(currentZoom);
+    } else {
+      shell.style.setProperty("zoom", String(currentZoom));
+    }
+    requestAnimationFrame(() => scheduleTerminalFit());
+    if (announce) showToast(`页面缩放：${Math.round(currentZoom * 100)}%`);
+  } catch (error) {
+    if (announce) showToast(error instanceof Error ? error.message : "页面缩放失败");
+  }
+}
+
+function changePageZoom(step: -1 | 1): void {
+  const index = ZOOM_LEVELS.indexOf(currentZoom);
+  const nextIndex = Math.max(0, Math.min(ZOOM_LEVELS.length - 1, index + step));
+  if (nextIndex !== index) void applyPageZoom(ZOOM_LEVELS[nextIndex]);
+}
+
+function updateAvatarUi(): void {
+  const source = selfAvatarSource();
+  query<HTMLImageElement>("#self-avatar").src = source;
+  query<HTMLImageElement>("#title-avatar").src = source;
+  query<HTMLImageElement>("#about-avatar").src = source;
+  if (snapshot) {
+    renderContacts();
+    if (snapshot.activeContactId === snapshot.currentUser.id) renderChatHeader();
+  }
+}
+
+function openAvatarDialog(): void {
+  pendingAvatar = customAvatar;
+  avatarPreview.src = pendingAvatar ?? selfAvatar;
+  avatarFileInput.value = "";
+  query("#avatar-file-name").textContent = pendingAvatar ? "自定义头像" : "默认头像";
+  avatarError.textContent = "";
+  popupMenu.hidden = true;
+  avatarDialog.hidden = false;
+  query<HTMLButtonElement>("#avatar-choose").focus();
+}
+
+function closeAvatarDialog(restoreFocus = true): void {
+  avatarDialog.hidden = true;
+  avatarFileInput.value = "";
+  avatarError.textContent = "";
+  if (restoreFocus) query<HTMLButtonElement>("#self-avatar-button").focus();
+}
+
+async function createAvatarFromFile(file: File): Promise<string> {
+  if (!/^image\/(png|jpeg|webp|gif|bmp)$/i.test(file.type)) {
+    throw new Error("请选择 PNG、JPG、WebP、GIF 或 BMP 图片");
+  }
+  if (file.size > 10 * 1024 * 1024) throw new Error("图片不能超过 10 MB");
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = document.createElement("img");
+    image.src = objectUrl;
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("无法读取这张图片"));
+    });
+    if (!image.naturalWidth || !image.naturalHeight) throw new Error("图片尺寸无效");
+
+    const size = Math.min(image.naturalWidth, image.naturalHeight);
+    const sourceX = (image.naturalWidth - size) / 2;
+    const sourceY = (image.naturalHeight - size) / 2;
+    const canvas = document.createElement("canvas");
+    canvas.width = 256;
+    canvas.height = 256;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("当前环境无法处理图片");
+    context.drawImage(image, sourceX, sourceY, size, size, 0, 0, 256, 256);
+    return canvas.toDataURL("image/webp", 0.86);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function selectAvatarFile(file: File | undefined): Promise<void> {
+  if (!file) return;
+  avatarError.textContent = "";
+  try {
+    pendingAvatar = await createAvatarFromFile(file);
+    avatarPreview.src = pendingAvatar;
+    query("#avatar-file-name").textContent = file.name;
+  } catch (error) {
+    avatarError.textContent = error instanceof Error ? error.message : "头像处理失败";
+  }
+}
+
+function saveAvatar(): void {
+  try {
+    if (pendingAvatar) localStorage.setItem(AVATAR_STORAGE_KEY, pendingAvatar);
+    else localStorage.removeItem(AVATAR_STORAGE_KEY);
+  } catch {
+    avatarError.textContent = "无法保存头像，本地存储空间不足";
+    return;
+  }
+  customAvatar = pendingAvatar;
+  updateAvatarUi();
+  closeAvatarDialog(false);
+  query<HTMLButtonElement>("#self-avatar-button").focus();
+  showToast(customAvatar ? "头像已更新" : "已恢复默认头像");
 }
 
 function updateProfile(): void {
@@ -1910,8 +2098,14 @@ function bindEvents(): void {
   query("#new-message").addEventListener("click", () => messageInput.focus());
   query("#show-recent").addEventListener("click", () => setTab("recent"));
   query("#sound-toggle").addEventListener("click", toggleSound);
+  query("#zoom-out").addEventListener("click", () => changePageZoom(-1));
+  query("#zoom-reset").addEventListener("click", () => void applyPageZoom(1));
+  query("#zoom-in").addEventListener("click", () => changePageZoom(1));
+  query("#self-avatar-button").addEventListener("click", openAvatarDialog);
   query("#settings-button").addEventListener("click", (event) => {
     showPopup(event.currentTarget as HTMLElement, [
+      { label: "更换头像...", action: openAvatarDialog },
+      { separator: true, label: "" },
       { label: "在线", action: () => void setUserPresence("online") },
       { label: "离开", action: () => void setUserPresence("away") },
       { label: "忙碌", action: () => void setUserPresence("busy") },
@@ -2021,8 +2215,14 @@ function bindEvents(): void {
           { label: "好友列表", action: () => setTab("friends") },
           { label: "最近联系人", action: () => setTab("recent") },
           { label: "聊天记录", action: () => transcript.scrollTo({ top: 0 }) },
+          { separator: true, label: "" },
+          { label: `放大页面 (${Math.round(currentZoom * 100)}%)`, action: () => changePageZoom(1), disabled: currentZoom === ZOOM_LEVELS.at(-1) },
+          { label: "恢复原始大小 (100%)", action: () => void applyPageZoom(1), disabled: currentZoom === 1 },
+          { label: `缩小页面 (${Math.round(currentZoom * 100)}%)`, action: () => changePageZoom(-1), disabled: currentZoom === ZOOM_LEVELS[0] },
         ],
         tools: [
+          { label: "更换头像...", action: openAvatarDialog },
+          { separator: true, label: "" },
           { label: soundEnabled ? "关闭消息声音" : "打开消息声音", action: toggleSound },
           { label: "切换为在线", action: () => void setUserPresence("online") },
           { label: "切换为离开", action: () => void setUserPresence("away") },
@@ -2039,6 +2239,17 @@ function bindEvents(): void {
 
   query("#dialog-close").addEventListener("click", closeAbout);
   query("#dialog-ok").addEventListener("click", closeAbout);
+  query("#avatar-dialog-close").addEventListener("click", () => closeAvatarDialog());
+  query("#avatar-cancel").addEventListener("click", () => closeAvatarDialog());
+  query("#avatar-save").addEventListener("click", saveAvatar);
+  query("#avatar-choose").addEventListener("click", () => avatarFileInput.click());
+  query("#avatar-default").addEventListener("click", () => {
+    pendingAvatar = null;
+    avatarPreview.src = selfAvatar;
+    query("#avatar-file-name").textContent = "默认头像";
+    avatarError.textContent = "";
+  });
+  avatarFileInput.addEventListener("change", () => void selectAvatarFile(avatarFileInput.files?.[0]));
   query("#terminal-rename-close").addEventListener("click", () => closeRenameTerminal());
   query("#terminal-rename-cancel").addEventListener("click", () => closeRenameTerminal());
   query<HTMLFormElement>("#terminal-rename-form").addEventListener("submit", (event) => {
@@ -2051,6 +2262,9 @@ function bindEvents(): void {
   aboutDialog.addEventListener("click", (event) => {
     if (event.target === aboutDialog) closeAbout();
   });
+  avatarDialog.addEventListener("click", (event) => {
+    if (event.target === avatarDialog) closeAvatarDialog();
+  });
   document.addEventListener("pointerdown", (event) => {
     if (!popupMenu.hidden && !popupMenu.contains(event.target as Node)) {
       const trigger = (event.target as Element).closest(".menu-trigger, #settings-button, #presence-trigger, #send-options");
@@ -2058,9 +2272,27 @@ function bindEvents(): void {
     }
   });
   document.addEventListener("keydown", (event) => {
+    if (event.ctrlKey && !event.altKey) {
+      if (event.key === "0") {
+        event.preventDefault();
+        void applyPageZoom(1);
+        return;
+      }
+      if (event.key === "-" || event.code === "NumpadSubtract") {
+        event.preventDefault();
+        changePageZoom(-1);
+        return;
+      }
+      if (event.key === "=" || event.key === "+" || event.code === "NumpadAdd") {
+        event.preventDefault();
+        changePageZoom(1);
+        return;
+      }
+    }
     if (event.key === "Escape") {
       popupMenu.hidden = true;
       if (!terminalRenameDialog.hidden) closeRenameTerminal();
+      if (!avatarDialog.hidden) closeAvatarDialog();
       closeAbout();
     }
   });
@@ -2069,6 +2301,7 @@ function bindEvents(): void {
 async function start(): Promise<void> {
   refreshIcons();
   bindEvents();
+  await applyPageZoom(currentZoom, false);
   void syncWindowState();
   if (isTauriRuntime()) {
     const appWindow = getCurrentWindow();
