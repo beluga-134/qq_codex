@@ -198,6 +198,7 @@ let messageCompositionResetTimer: number | null = null;
 let lastWindowMaximized: boolean | null = null;
 let windowStateSyncScheduled = false;
 let renamingTerminalId: string | null = null;
+let toastTimer: number | null = null;
 const ZOOM_STORAGE_KEY = "ociq.ui.zoom";
 const AVATAR_STORAGE_KEY = "ociq.profile.avatar";
 const ZOOM_LEVELS = [0.75, 0.9, 1, 1.1, 1.25, 1.5];
@@ -485,6 +486,70 @@ function ptyBytes(value: unknown): Uint8Array {
     if (buffer instanceof ArrayBuffer) return new Uint8Array(buffer);
   }
   return new TextEncoder().encode(String(value ?? ""));
+}
+
+async function writeClipboardText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("当前环境不支持写入剪贴板");
+}
+
+async function copyTerminalSelection(pane: TerminalPaneRuntime): Promise<void> {
+  const selection = pane.terminal.getSelection();
+  if (!selection) {
+    showToast("请先选择要复制的终端内容");
+    return;
+  }
+
+  try {
+    await writeClipboardText(selection);
+    showToast("复制成功", "top-right");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "复制终端内容失败");
+  } finally {
+    pane.terminal.focus();
+  }
+}
+
+async function pasteTerminalClipboard(pane: TerminalPaneRuntime): Promise<void> {
+  try {
+    if (!navigator.clipboard?.readText) throw new Error("当前环境不支持读取剪贴板");
+    const text = await navigator.clipboard.readText();
+    if (text) pane.terminal.paste(text);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "粘贴终端内容失败");
+  } finally {
+    pane.terminal.focus();
+  }
+}
+
+function handleTerminalClipboardShortcut(
+  pane: TerminalPaneRuntime,
+  event: KeyboardEvent,
+): boolean {
+  const isClipboardShortcut =
+    !event.ctrlKey && event.altKey && event.shiftKey && !event.metaKey;
+  if (!isClipboardShortcut || (event.code !== "KeyC" && event.code !== "KeyV")) return true;
+
+  event.preventDefault();
+  event.stopPropagation();
+  if (event.type === "keydown" && !event.repeat) {
+    if (event.code === "KeyC") void copyTerminalSelection(pane);
+    else void pasteTerminalClipboard(pane);
+  }
+  return false;
 }
 
 function terminalWorkspace(
@@ -1066,6 +1131,7 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
     disposed: false,
     disposables: [],
   };
+  terminal.attachCustomKeyEventHandler((event) => handleTerminalClipboardShortcut(pane, event));
   element.addEventListener(
     "mousedown",
     (event) => {
@@ -1286,11 +1352,15 @@ function updateClock(): void {
   }).format(Date.now());
 }
 
-function showToast(text: string): void {
+function showToast(text: string, placement: "bottom-right" | "top-right" = "bottom-right"): void {
+  if (toastTimer !== null) window.clearTimeout(toastTimer);
   toast.textContent = text;
+  toast.classList.toggle("is-top-right", placement === "top-right");
   toast.hidden = false;
-  window.setTimeout(() => {
+  toastTimer = window.setTimeout(() => {
     toast.hidden = true;
+    toast.classList.remove("is-top-right");
+    toastTimer = null;
   }, 2200);
 }
 

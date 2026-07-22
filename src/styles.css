@@ -1707,6 +1707,11 @@ svg {
   color: #202020;
 }
 
+.toast.is-top-right {
+  top: 12px;
+  bottom: auto;
+}
+
 .dialog-backdrop {
   position: fixed;
   z-index: 110;
