@@ -65,6 +65,52 @@ pub struct TerminalExecution {
     pub success: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFolderLocation {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFolderResolution {
+    pub name: String,
+    pub path: String,
+    pub wsl_path: String,
+    pub wsl_distribution: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyOpenResult {
+    pub session_id: u64,
+    pub project: Option<ProjectFolderResolution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedProjectFolder {
+    location: ProjectFolderLocation,
+    wsl_path: String,
+    wsl_distribution: Option<String>,
+    windows_path: Option<String>,
+    source: ProjectFolderSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectFolderSource {
+    WindowsDrive,
+    WindowsUnc,
+    WslUnc,
+    Wsl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectShellTarget {
+    wsl_path: String,
+    wsl_distribution: Option<String>,
+}
+
 /// A live pseudo-terminal. The shell remains attached to this session until
 /// the user explicitly closes it or the shell exits, so cd/env/interactive
 /// programs keep their state between commands.
@@ -564,6 +610,351 @@ fn normalize_terminal_name(input: &str) -> Result<String, String> {
     Ok(trimmed.into())
 }
 
+fn windows_component_is_valid(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        })
+        && !component.ends_with('.')
+        && !component.ends_with(' ')
+}
+
+fn normalize_project_components(input: &str, windows_rules: bool) -> Result<Vec<String>, String> {
+    let mut components = Vec::new();
+    for component in input.split(|character| character == '\\' || character == '/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            if components.pop().is_none() {
+                return Err("项目路径不能越过根目录".into());
+            }
+            continue;
+        }
+        if component.chars().any(char::is_control) {
+            return Err("项目路径包含不支持的控制字符".into());
+        }
+        if windows_rules && !windows_component_is_valid(component) {
+            return Err("项目路径包含 Windows 不支持的字符".into());
+        }
+        components.push(component.to_string());
+    }
+    Ok(components)
+}
+
+fn parse_windows_drive_path(input: &str) -> Option<Result<ResolvedProjectFolder, String>> {
+    let mut characters = input.chars();
+    let drive = characters.next()?;
+    if characters.next() != Some(':') {
+        return None;
+    }
+    if !drive.is_ascii_alphabetic() || !matches!(characters.next(), Some('\\' | '/')) {
+        return Some(Err(
+            "Windows 项目路径必须是盘符绝对路径，例如 C:\\workspace\\project".into(),
+        ));
+    }
+
+    let drive = drive.to_ascii_uppercase();
+    let components = match normalize_project_components(characters.as_str(), true) {
+        Ok(components) => components,
+        Err(error) => return Some(Err(error)),
+    };
+    let path = if components.is_empty() {
+        format!("{drive}:\\")
+    } else {
+        format!("{drive}:\\{}", components.join("\\"))
+    };
+    let name = components
+        .last()
+        .cloned()
+        .unwrap_or_else(|| format!("{drive} 盘"));
+    let drive_lower = drive.to_ascii_lowercase();
+    let wsl_path = if components.is_empty() {
+        format!("/mnt/{drive_lower}")
+    } else {
+        format!("/mnt/{drive_lower}/{}", components.join("/"))
+    };
+
+    Some(Ok(ResolvedProjectFolder {
+        location: ProjectFolderLocation {
+            name,
+            path: path.clone(),
+        },
+        wsl_path,
+        wsl_distribution: None,
+        windows_path: Some(path),
+        source: ProjectFolderSource::WindowsDrive,
+    }))
+}
+
+fn parse_windows_unc_path(input: &str) -> Result<ResolvedProjectFolder, String> {
+    let components: Vec<&str> = input
+        .trim_start_matches(|character| character == '\\' || character == '/')
+        .split(|character| character == '\\' || character == '/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components.len() < 2 {
+        return Err("UNC 项目路径必须包含服务器和共享名称".into());
+    }
+
+    let server = components[0];
+    let share = components[1];
+    let is_wsl_unc =
+        server.eq_ignore_ascii_case("wsl.localhost") || server.eq_ignore_ascii_case("wsl$");
+    if is_wsl_unc {
+        if !windows_component_is_valid(share) {
+            return Err("WSL 发行版名称无效".into());
+        }
+        let linux_components = normalize_project_components(&components[2..].join("/"), false)?;
+        let server = if server.eq_ignore_ascii_case("wsl.localhost") {
+            "wsl.localhost"
+        } else {
+            "wsl$"
+        };
+        let mut path = format!(r"\\{server}\{share}");
+        if !linux_components.is_empty() {
+            path.push('\\');
+            path.push_str(&linux_components.join("\\"));
+        }
+        let wsl_path = if linux_components.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", linux_components.join("/"))
+        };
+        let name = linux_components
+            .last()
+            .cloned()
+            .unwrap_or_else(|| share.to_string());
+        return Ok(ResolvedProjectFolder {
+            location: ProjectFolderLocation {
+                name,
+                path: path.clone(),
+            },
+            wsl_path,
+            wsl_distribution: Some(share.to_string()),
+            windows_path: Some(path),
+            source: ProjectFolderSource::WslUnc,
+        });
+    }
+
+    if !windows_component_is_valid(server) || !windows_component_is_valid(share) {
+        return Err("UNC 项目路径的服务器或共享名称无效".into());
+    }
+    let path_components = normalize_project_components(&components[2..].join("/"), true)?;
+    let mut path = format!(r"\\{server}\{share}");
+    if !path_components.is_empty() {
+        path.push('\\');
+        path.push_str(&path_components.join("\\"));
+    }
+    let name = path_components
+        .last()
+        .cloned()
+        .unwrap_or_else(|| share.to_string());
+    Ok(ResolvedProjectFolder {
+        location: ProjectFolderLocation {
+            name,
+            path: path.clone(),
+        },
+        wsl_path: path.clone(),
+        wsl_distribution: None,
+        windows_path: Some(path),
+        source: ProjectFolderSource::WindowsUnc,
+    })
+}
+
+fn parse_wsl_path(input: &str) -> Result<ResolvedProjectFolder, String> {
+    let components = normalize_project_components(input, false)?;
+    let path = if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    };
+    let name = components
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "/".to_string());
+    Ok(ResolvedProjectFolder {
+        location: ProjectFolderLocation {
+            name,
+            path: path.clone(),
+        },
+        wsl_path: path,
+        wsl_distribution: None,
+        windows_path: None,
+        source: ProjectFolderSource::Wsl,
+    })
+}
+
+fn parse_project_folder_path(input: &str) -> Result<ResolvedProjectFolder, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("项目路径不能为空".into());
+    }
+    if trimmed.chars().count() > 1024 {
+        return Err("项目路径不能超过 1024 个字符".into());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("项目路径包含不支持的控制字符".into());
+    }
+    if let Some(result) = parse_windows_drive_path(trimmed) {
+        return result;
+    }
+    if trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
+        return parse_windows_unc_path(trimmed);
+    }
+    parse_wsl_path(trimmed)
+}
+
+fn project_shell_target_from_cache(
+    wsl_path: &str,
+    wsl_distribution: Option<&str>,
+) -> Result<ProjectShellTarget, String> {
+    if wsl_path.trim() != wsl_path
+        || wsl_path.chars().count() > 1024
+        || wsl_path.chars().any(char::is_control)
+        || !wsl_path.starts_with('/')
+    {
+        return Err("项目的 WSL 路径缓存无效，请重新添加该项目".into());
+    }
+    let normalized = parse_wsl_path(wsl_path)?;
+    if normalized.wsl_path != wsl_path {
+        return Err("项目的 WSL 路径缓存无效，请重新添加该项目".into());
+    }
+
+    let wsl_distribution = wsl_distribution
+        .map(|distribution| {
+            if distribution.trim() != distribution
+                || distribution.chars().count() > 128
+                || distribution
+                    .chars()
+                    .any(|character| matches!(character, '/' | '\\'))
+                || !windows_component_is_valid(distribution)
+            {
+                return Err("项目的 WSL 发行版缓存无效，请重新添加该项目".to_string());
+            }
+            Ok(distribution.to_string())
+        })
+        .transpose()?;
+
+    Ok(ProjectShellTarget {
+        wsl_path: wsl_path.to_string(),
+        wsl_distribution,
+    })
+}
+
+fn project_shell_target(resolved: &ResolvedProjectFolder) -> ProjectShellTarget {
+    ProjectShellTarget {
+        wsl_path: resolved.wsl_path.clone(),
+        wsl_distribution: resolved.wsl_distribution.clone(),
+    }
+}
+
+fn project_folder_resolution(resolved: ResolvedProjectFolder) -> ProjectFolderResolution {
+    ProjectFolderResolution {
+        name: resolved.location.name,
+        path: resolved.location.path,
+        wsl_path: resolved.wsl_path,
+        wsl_distribution: resolved.wsl_distribution,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_command(distribution: Option<&str>) -> Command {
+    let mut command = Command::new("wsl.exe");
+    if let Some(distribution) = distribution {
+        command.args(["--distribution", distribution]);
+    }
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_command_text(mut command: Command) -> Result<String, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("无法启动 WSL：{error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "WSL 无法访问该项目文件夹".into()
+        } else {
+            format!("WSL 无法访问该项目文件夹：{detail}")
+        });
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err("WSL 未返回项目路径".into());
+    }
+    Ok(text)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_path_to_wsl(path: &str) -> Result<String, String> {
+    let mut command = wsl_command(None);
+    command.args(["--cd", path, "--exec", "pwd"]);
+    wsl_command_text(command)
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_path_to_windows(path: &str, distribution: Option<&str>) -> Result<String, String> {
+    let mut command = wsl_command(distribution);
+    command.args(["--cd", path, "--exec", "wslpath", "-w", "."]);
+    wsl_command_text(command)
+}
+
+fn resolve_project_folder_path(input: &str) -> Result<ResolvedProjectFolder, String> {
+    let mut resolved = parse_project_folder_path(input)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(windows_path) = resolved.windows_path.as_deref() {
+            if Path::new(windows_path).is_dir() {
+                if resolved.source == ProjectFolderSource::WslUnc {
+                    return Ok(resolved);
+                }
+                resolved.wsl_path = windows_path_to_wsl(windows_path).map_err(|error| {
+                    format!("Windows 可以访问该文件夹，但当前 WSL 无法将其作为工作目录：{error}")
+                })?;
+                return Ok(resolved);
+            }
+
+            if matches!(
+                resolved.source,
+                ProjectFolderSource::WindowsDrive | ProjectFolderSource::WslUnc
+            ) {
+                if let Ok(explorer_path) =
+                    wsl_path_to_windows(&resolved.wsl_path, resolved.wsl_distribution.as_deref())
+                {
+                    let original_wsl_path = resolved.wsl_path.clone();
+                    let mut fallback = parse_project_folder_path(&explorer_path)?;
+                    fallback.wsl_path = original_wsl_path;
+                    return Ok(fallback);
+                }
+            }
+            return Err(format!("项目文件夹不存在或无法访问：{windows_path}"));
+        }
+
+        let explorer_path = wsl_path_to_windows(&resolved.wsl_path, None)?;
+        let original_wsl_path = resolved.wsl_path.clone();
+        let mut fallback = parse_project_folder_path(&explorer_path)?;
+        fallback.wsl_path = original_wsl_path;
+        return Ok(fallback);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if Path::new(&resolved.wsl_path).is_dir() {
+            Ok(resolved)
+        } else {
+            Err(format!(
+                "项目文件夹不存在或无法访问：{}",
+                resolved.location.path
+            ))
+        }
+    }
+}
+
 fn terminal_working_directory() -> PathBuf {
     if let Ok(project_root) = std::env::var("PROJECT_ROOT") {
         let path = PathBuf::from(project_root);
@@ -672,8 +1063,27 @@ fn pty_shell_candidates() -> Vec<(&'static str, CommandBuilder)> {
     vec![("系统默认 shell", CommandBuilder::new_default_prog())]
 }
 
-fn configure_pty_command(command: &mut CommandBuilder) {
-    command.cwd(terminal_working_directory());
+fn configure_pty_command(
+    command: &mut CommandBuilder,
+    project_target: Option<&ProjectShellTarget>,
+) {
+    #[cfg(target_os = "windows")]
+    if let Some(project_target) = project_target {
+        if let Some(distribution) = project_target.wsl_distribution.as_deref() {
+            command.args(["--distribution", distribution]);
+        }
+        command.args(["--cd", project_target.wsl_path.as_str()]);
+    } else {
+        command.cwd(terminal_working_directory());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    command.cwd(
+        project_target
+            .map(|target| PathBuf::from(&target.wsl_path))
+            .unwrap_or_else(terminal_working_directory),
+    );
+
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env("TERM_PROGRAM", "RetroMessenger");
@@ -853,17 +1263,43 @@ fn execute_terminal(
     store.execute_terminal(&command)
 }
 
+#[tauri::command]
+fn parse_project_folder(path: String) -> Result<ProjectFolderResolution, String> {
+    parse_project_folder_path(&path).map(project_folder_resolution)
+}
+
 /// Open a persistent login shell and stream every byte it writes to xterm.js.
 /// `Response` keeps the payload binary, which matters for split UTF-8 sequences
 /// and for terminal protocols such as mouse reporting.
-#[tauri::command]
+#[tauri::command(async)]
 fn pty_open(
     rows: u16,
     cols: u16,
+    project_path: Option<String>,
+    project_wsl_path: Option<String>,
+    project_wsl_distribution: Option<String>,
     on_data: Channel<Response>,
     on_exit: Channel<PtyExit>,
     state: State<'_, PtyState>,
-) -> Result<u64, String> {
+) -> Result<PtyOpenResult, String> {
+    if project_wsl_path.is_none() && project_wsl_distribution.is_some() {
+        return Err("项目缺少 WSL 路径缓存，请重新添加该项目".into());
+    }
+    let (project_target, project_resolution) = if let Some(wsl_path) = project_wsl_path.as_deref() {
+        (
+            Some(project_shell_target_from_cache(
+                wsl_path,
+                project_wsl_distribution.as_deref(),
+            )?),
+            None,
+        )
+    } else if let Some(project_path) = project_path.as_deref() {
+        let resolved = resolve_project_folder_path(project_path)?;
+        let target = project_shell_target(&resolved);
+        (Some(target), Some(project_folder_resolution(resolved)))
+    } else {
+        (None, None)
+    };
     let size = PtySize {
         rows: rows.max(1),
         cols: cols.max(2),
@@ -886,7 +1322,7 @@ fn pty_open(
     let mut spawn_errors = Vec::new();
     let mut child = None;
     for (shell_name, mut command) in pty_shell_candidates() {
-        configure_pty_command(&mut command);
+        configure_pty_command(&mut command, project_target.as_ref());
         match pair.slave.spawn_command(command) {
             Ok(spawned) => {
                 child = Some(spawned);
@@ -980,7 +1416,10 @@ fn pty_open(
         let _ = on_exit.send(exit);
     });
 
-    Ok(session_id)
+    Ok(PtyOpenResult {
+        session_id,
+        project: project_resolution,
+    })
 }
 
 #[tauri::command]
@@ -1097,6 +1536,7 @@ pub fn run() {
             create_terminal_contact,
             rename_terminal_contact,
             execute_terminal,
+            parse_project_folder,
             pty_open,
             pty_write,
             pty_resize,
@@ -1196,6 +1636,136 @@ mod tests {
     }
 
     #[test]
+    fn project_folder_paths_are_normalized_for_windows_and_wsl() {
+        let drive =
+            parse_project_folder_path(r#"  d:/Workspace//中文 项目/.\packages\..\app  "#).unwrap();
+
+        assert_eq!(drive.location.name, "app");
+        assert_eq!(drive.location.path, r#"D:\Workspace\中文 项目\app"#);
+        assert_eq!(drive.wsl_path, "/mnt/d/Workspace/中文 项目/app");
+        assert_eq!(drive.source, ProjectFolderSource::WindowsDrive);
+
+        let root = parse_project_folder_path(r#"c:\"#).unwrap();
+        assert_eq!(root.location.name, "C 盘");
+        assert_eq!(root.location.path, r#"C:\"#);
+        assert_eq!(root.wsl_path, "/mnt/c");
+
+        let unc = parse_project_folder_path(
+            r#"\\wsl.localhost\Ubuntu\home\beluga\project\CNV_polidy_identify"#,
+        )
+        .unwrap();
+        assert_eq!(unc.location.name, "CNV_polidy_identify");
+        assert_eq!(
+            unc.location.path,
+            r#"\\wsl.localhost\Ubuntu\home\beluga\project\CNV_polidy_identify"#
+        );
+        assert_eq!(unc.wsl_path, "/home/beluga/project/CNV_polidy_identify");
+        assert_eq!(unc.wsl_distribution.as_deref(), Some("Ubuntu"));
+        assert_eq!(unc.source, ProjectFolderSource::WslUnc);
+
+        let legacy_unc = parse_project_folder_path(r#"\\wsl$\Ubuntu\home\beluga\project"#).unwrap();
+        assert_eq!(
+            legacy_unc.location.path,
+            r#"\\wsl$\Ubuntu\home\beluga\project"#
+        );
+        assert_eq!(legacy_unc.wsl_path, "/home/beluga/project");
+
+        for input in [
+            r#"home\beluga\project\CNV_polidy_identify"#,
+            "home/beluga/project/CNV_polidy_identify",
+            "/home/beluga/project/CNV_polidy_identify",
+        ] {
+            let fallback = parse_project_folder_path(input).unwrap();
+            assert_eq!(
+                fallback.location.path,
+                "/home/beluga/project/CNV_polidy_identify"
+            );
+            assert_eq!(fallback.wsl_path, fallback.location.path);
+            assert_eq!(fallback.source, ProjectFolderSource::Wsl);
+        }
+    }
+
+    #[test]
+    fn project_folder_paths_reject_ambiguous_or_unsafe_input() {
+        for invalid in [
+            "",
+            r#"C:workspace"#,
+            r#"1:\workspace"#,
+            r#"D:\..\workspace"#,
+            r#"D:\bad?name"#,
+            r#"\\server"#,
+            r#"\\server\share\..\workspace"#,
+            "/../../home/beluga",
+            "D:\\bad\nname",
+        ] {
+            assert!(
+                parse_project_folder_path(invalid).is_err(),
+                "unexpectedly accepted: {invalid:?}"
+            );
+        }
+        assert!(parse_project_folder_path(&"a".repeat(1025)).is_err());
+    }
+
+    #[test]
+    fn adding_a_project_only_parses_the_path() {
+        let unc = parse_project_folder(
+            r#"\\wsl.localhost\Ubuntu\definitely-missing\project"#.to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            unc.path,
+            r#"\\wsl.localhost\Ubuntu\definitely-missing\project"#
+        );
+        assert_eq!(unc.wsl_path, "/definitely-missing/project");
+        assert_eq!(unc.wsl_distribution.as_deref(), Some("Ubuntu"));
+
+        let drive = parse_project_folder(r#"Z:\definitely-missing\project"#.to_string()).unwrap();
+        assert_eq!(drive.path, r#"Z:\definitely-missing\project"#);
+        assert_eq!(drive.wsl_path, "/mnt/z/definitely-missing/project");
+    }
+
+    #[test]
+    fn project_shell_cache_only_accepts_canonical_launch_targets() {
+        let target =
+            project_shell_target_from_cache("/home/beluga/中文 项目", Some("Ubuntu-24.04"))
+                .unwrap();
+        assert_eq!(target.wsl_path, "/home/beluga/中文 项目");
+        assert_eq!(target.wsl_distribution.as_deref(), Some("Ubuntu-24.04"));
+        assert!(project_shell_target_from_cache("/", None).is_ok());
+
+        for invalid_path in [
+            "home/beluga/project",
+            "/home/../etc",
+            "/home/./project",
+            "/home//project",
+            "/home/project/",
+            "/home\\project",
+            "/home/\nproject",
+        ] {
+            assert!(
+                project_shell_target_from_cache(invalid_path, None).is_err(),
+                "unexpectedly accepted cached path: {invalid_path:?}"
+            );
+        }
+        assert!(project_shell_target_from_cache(&format!("/{}", "a".repeat(1024)), None).is_err());
+
+        for invalid_distribution in [
+            "",
+            " Ubuntu",
+            "Ubuntu ",
+            "Ubuntu/bad",
+            "Ubuntu\\bad",
+            "Ubuntu?",
+        ] {
+            assert!(
+                project_shell_target_from_cache("/home/beluga", Some(invalid_distribution))
+                    .is_err(),
+                "unexpectedly accepted cached distribution: {invalid_distribution:?}"
+            );
+        }
+    }
+
+    #[test]
     fn terminal_help_matches_the_platform_shell() {
         let help = terminal_help_text();
 
@@ -1226,12 +1796,21 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_pty_is_wsl_only() {
-        let candidates = pty_shell_candidates();
+    fn windows_pty_uses_the_unc_distribution_and_passes_cwd_as_one_argument() {
+        let mut candidates = pty_shell_candidates();
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, "WSL");
         assert_eq!(candidates[0].1.get_argv()[0].to_string_lossy(), "wsl.exe");
+
+        let target =
+            project_shell_target_from_cache("/home/beluga/中文 项目", Some("Ubuntu")).unwrap();
+        configure_pty_command(&mut candidates[0].1, Some(&target));
+        let arguments = candidates[0].1.get_argv();
+        assert_eq!(arguments[1].to_string_lossy(), "--distribution");
+        assert_eq!(arguments[2].to_string_lossy(), "Ubuntu");
+        assert_eq!(arguments[3].to_string_lossy(), "--cd");
+        assert_eq!(arguments[4].to_string_lossy(), "/home/beluga/中文 项目");
     }
 
     #[test]

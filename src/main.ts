@@ -8,6 +8,8 @@ import {
   createIcons,
   Eraser,
   FileUp,
+  Folder,
+  FolderOpen,
   History,
   Image,
   Italic,
@@ -49,11 +51,14 @@ import "./styles.css";
 import "@xterm/xterm/css/xterm.css";
 import { backend, type PtyExit } from "./backend";
 import {
+  PROJECT_CONTACT_PREFIX,
   TERMINAL_CONTACT_ID,
   type AppSnapshot,
   type Contact,
   type Message,
   type Presence,
+  type ProjectFolder,
+  type ProjectFolderLocation,
 } from "./types";
 
 import selfAvatar from "./assets/avatars/self.png";
@@ -97,6 +102,8 @@ const iconSet = {
   Columns2,
   Eraser,
   FileUp,
+  Folder,
+  FolderOpen,
   History,
   Image,
   Italic,
@@ -179,6 +186,7 @@ interface TerminalPaneRuntime {
 
 interface TerminalWorkspace {
   contactId: string;
+  projectFolder: ProjectFolder | null;
   layout: TerminalLayoutNode | null;
   activePaneId: number | null;
   nextPaneId: number;
@@ -198,13 +206,18 @@ let messageCompositionResetTimer: number | null = null;
 let lastWindowMaximized: boolean | null = null;
 let windowStateSyncScheduled = false;
 let renamingTerminalId: string | null = null;
+let renamingProjectId: string | null = null;
+let pendingProjectRemovalId: string | null = null;
 let toastTimer: number | null = null;
+let contactSelectionSequence = 0;
 const ZOOM_STORAGE_KEY = "ociq.ui.zoom";
 const AVATAR_STORAGE_KEY = "ociq.profile.avatar";
+const PROJECT_FOLDERS_STORAGE_KEY = "ociq.project-folders.v1";
 const ZOOM_LEVELS = [0.75, 0.9, 1, 1.1, 1.25, 1.5];
 let currentZoom = readStoredZoom();
 let customAvatar = readStoredAvatar();
 let pendingAvatar: string | null = customAvatar;
+let projectFolders = readStoredProjectFolders();
 const terminalWorkspaces = new Map<string, TerminalWorkspace>();
 const MAX_TERMINAL_PANES = 4;
 const collapsedGroups = new Set<string>();
@@ -231,6 +244,113 @@ function readStoredAvatar(): string | null {
   } catch {
     return null;
   }
+}
+
+function isStoredProjectPath(path: string): boolean {
+  if (!path || [...path].length > 1024 || /[\u0000-\u001f\u007f]/.test(path)) return false;
+  return /^[A-Za-z]:\\/.test(path)
+    || /^\\\\[^\\]+\\[^\\]+/.test(path)
+    || path.startsWith("/");
+}
+
+function isStoredWslPath(value: unknown): value is string {
+  if (
+    typeof value !== "string"
+    || !value.startsWith("/")
+    || [...value].length > 1024
+    || /[\\\u0000-\u001f\u007f]/.test(value)
+  ) return false;
+  if (value === "/") return true;
+  if (value.endsWith("/") || value.includes("//")) return false;
+  return value.slice(1).split("/").every((component) => component !== "." && component !== "..");
+}
+
+function isStoredWslDistribution(value: unknown): value is string | null {
+  if (value === null) return true;
+  return typeof value === "string"
+    && value === value.trim()
+    && value.length > 0
+    && [...value].length <= 128
+    && !/[\\/\u0000-\u001f\u007f<>:"|?*]/.test(value)
+    && !/[. ]$/.test(value);
+}
+
+function hasProjectLaunchCache(folder: ProjectFolder): folder is ProjectFolder & { wslPath: string } {
+  return isStoredWslPath(folder.wslPath)
+    && folder.wslDistribution !== undefined
+    && isStoredWslDistribution(folder.wslDistribution);
+}
+
+function projectLaunchCache(
+  location: ProjectFolderLocation,
+): { wslPath: string; wslDistribution: string | null } | null {
+  return isStoredWslPath(location.wslPath)
+    && isStoredWslDistribution(location.wslDistribution)
+    ? {
+        wslPath: location.wslPath,
+        wslDistribution: location.wslDistribution,
+      }
+    : null;
+}
+
+function parsedProjectLaunchCache(
+  location: ProjectFolderLocation,
+): { wslPath: string; wslDistribution: string | null } | null {
+  return /^[A-Za-z]:\\/.test(location.path) ? null : projectLaunchCache(location);
+}
+
+function projectPathKey(path: string): string {
+  const wslUnc = /^\\\\(wsl\.localhost|wsl\$)\\([^\\]+)(.*)$/i.exec(path);
+  if (wslUnc) {
+    return `wsl-unc:${wslUnc[2]!.toLowerCase()}${wslUnc[3] ?? ""}`;
+  }
+  if (path.startsWith("/")) return `wsl:${path}`;
+  return `windows:${path.toLowerCase()}`;
+}
+
+function readStoredProjectFolders(): ProjectFolder[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(PROJECT_FOLDERS_STORAGE_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    const ids = new Set<string>();
+    const paths = new Set<string>();
+    return parsed.filter((value): value is ProjectFolder => {
+      if (!value || typeof value !== "object") return false;
+      const candidate = value as Partial<ProjectFolder>;
+      if (
+        typeof candidate.id !== "string" ||
+        typeof candidate.name !== "string" ||
+        typeof candidate.path !== "string" ||
+        !candidate.id ||
+        !candidate.name.trim() ||
+        /[\u0000-\u001f\u007f]/.test(candidate.name)
+      ) return false;
+      candidate.name = candidate.name.trim();
+      candidate.path = candidate.path.trim();
+      if (!isStoredProjectPath(candidate.path)) return false;
+      if (!hasProjectLaunchCache(candidate as ProjectFolder)) {
+        delete candidate.wslPath;
+        delete candidate.wslDistribution;
+      }
+      const normalizedPath = projectPathKey(candidate.path);
+      if (ids.has(candidate.id) || paths.has(normalizedPath)) return false;
+      ids.add(candidate.id);
+      paths.add(normalizedPath);
+      return true;
+    }).slice(0, 100);
+  } catch {
+    return [];
+  }
+}
+
+function saveProjectFolders(next: ProjectFolder[]): void {
+  localStorage.setItem(PROJECT_FOLDERS_STORAGE_KEY, JSON.stringify(next));
+  projectFolders = next;
+}
+
+function createProjectFolderId(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function selfAvatarSource(): string {
@@ -428,6 +548,52 @@ appRoot.innerHTML = `
         </form>
       </section>
     </div>
+    <div class="dialog-backdrop" id="project-folder-dialog" hidden>
+      <section class="xp-dialog project-folder-dialog" role="dialog" aria-modal="true" aria-labelledby="project-folder-title">
+        <form id="project-folder-form">
+          <div class="dialog-titlebar"><span id="project-folder-title">添加项目文件夹</span><button type="button" id="project-folder-close" aria-label="关闭">${icon("X", 12)}</button></div>
+          <div class="dialog-body project-folder-dialog-body">
+            <label for="project-folder-path">项目文件夹路径</label>
+            <input id="project-folder-path" type="text" maxlength="1024" autocomplete="off" spellcheck="false" placeholder="\\\\wsl.localhost\\Ubuntu\\home\\beluga\\project" />
+            <p class="dialog-field-error" id="project-folder-error" role="alert"></p>
+          </div>
+          <div class="dialog-actions">
+            <button class="xp-button" type="button" id="project-folder-cancel">取消</button>
+            <button class="xp-button default" type="submit" id="project-folder-submit">添加并进入</button>
+          </div>
+        </form>
+      </section>
+    </div>
+    <div class="dialog-backdrop" id="project-rename-dialog" hidden>
+      <section class="xp-dialog rename-terminal-dialog project-rename-dialog" role="dialog" aria-modal="true" aria-labelledby="project-rename-title">
+        <form id="project-rename-form">
+          <div class="dialog-titlebar"><span id="project-rename-title">修改项目名称</span><button type="button" id="project-rename-close" aria-label="关闭">${icon("X", 12)}</button></div>
+          <div class="dialog-body rename-terminal-body">
+            <label for="project-name-input">项目名称</label>
+            <input id="project-name-input" type="text" maxlength="64" autocomplete="off" spellcheck="false" />
+            <p class="dialog-field-error" id="project-rename-error" role="alert"></p>
+          </div>
+          <div class="dialog-actions">
+            <button class="xp-button" type="button" id="project-rename-cancel">取消</button>
+            <button class="xp-button default" type="submit">保存</button>
+          </div>
+        </form>
+      </section>
+    </div>
+    <div class="dialog-backdrop" id="project-remove-dialog" hidden>
+      <section class="xp-dialog project-remove-dialog" role="alertdialog" aria-modal="true" aria-labelledby="project-remove-title" aria-describedby="project-remove-message">
+        <div class="dialog-titlebar"><span id="project-remove-title">确认移除项目文件夹</span><button type="button" id="project-remove-close" aria-label="关闭">${icon("X", 12)}</button></div>
+        <div class="dialog-body project-remove-dialog-body">
+          <strong id="project-remove-name"></strong>
+          <p id="project-remove-path"></p>
+          <p id="project-remove-message">只会移除群组中的记录，不会删除文件夹或其中的文件。</p>
+        </div>
+        <div class="dialog-actions">
+          <button class="xp-button" type="button" id="project-remove-cancel">取消</button>
+          <button class="xp-button default danger" type="button" id="project-remove-confirm">移除</button>
+        </div>
+      </section>
+    </div>
     <div class="dialog-backdrop" id="about-dialog" hidden>
       <section class="xp-dialog" role="dialog" aria-modal="true" aria-labelledby="about-title">
         <div class="dialog-titlebar"><span id="about-title">关于 OICQ 2003</span><button id="dialog-close" aria-label="关闭">${icon("X", 12)}</button></div>
@@ -459,6 +625,14 @@ const toast = query<HTMLDivElement>("#toast");
 const terminalRenameDialog = query<HTMLDivElement>("#terminal-rename-dialog");
 const terminalNameInput = query<HTMLInputElement>("#terminal-name-input");
 const terminalRenameError = query<HTMLParagraphElement>("#terminal-rename-error");
+const projectFolderDialog = query<HTMLDivElement>("#project-folder-dialog");
+const projectFolderPathInput = query<HTMLInputElement>("#project-folder-path");
+const projectFolderError = query<HTMLParagraphElement>("#project-folder-error");
+const projectFolderSubmit = query<HTMLButtonElement>("#project-folder-submit");
+const projectRenameDialog = query<HTMLDivElement>("#project-rename-dialog");
+const projectNameInput = query<HTMLInputElement>("#project-name-input");
+const projectRenameError = query<HTMLParagraphElement>("#project-rename-error");
+const projectRemoveDialog = query<HTMLDivElement>("#project-remove-dialog");
 const aboutDialog = query<HTMLDivElement>("#about-dialog");
 const avatarDialog = query<HTMLDivElement>("#avatar-dialog");
 const avatarPreview = query<HTMLImageElement>("#avatar-preview");
@@ -469,8 +643,50 @@ function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
+function projectContactId(projectId: string): string {
+  return `${PROJECT_CONTACT_PREFIX}${projectId}`;
+}
+
+function projectIdFromContactId(contactId: string | undefined): string | null {
+  return contactId?.startsWith(PROJECT_CONTACT_PREFIX)
+    ? contactId.slice(PROJECT_CONTACT_PREFIX.length)
+    : null;
+}
+
+function projectFolderForContact(contactId = snapshot?.activeContactId): ProjectFolder | null {
+  const projectId = projectIdFromContactId(contactId);
+  return projectId ? projectFolders.find((folder) => folder.id === projectId) ?? null : null;
+}
+
+function isProjectContact(contactId = snapshot?.activeContactId): boolean {
+  return projectIdFromContactId(contactId) !== null;
+}
+
 function isTerminalContact(contactId = snapshot?.activeContactId): boolean {
-  return contactId === TERMINAL_CONTACT_ID || /^terminal-\d+$/.test(contactId ?? "");
+  return isProjectContact(contactId)
+    || contactId === TERMINAL_CONTACT_ID
+    || /^terminal-\d+$/.test(contactId ?? "");
+}
+
+function projectFolderContact(folder: ProjectFolder): Contact {
+  return {
+    id: projectContactId(folder.id),
+    displayName: folder.name,
+    account: folder.path,
+    avatarSeed: "terminal",
+    presence: "online",
+    statusMessage: "Windows / WSL 项目文件夹",
+    group: "项目文件夹",
+    unreadCount: 0,
+    lastMessage: "",
+    lastMessageAt: 0,
+  };
+}
+
+function syncProjectFolderContacts(): void {
+  snapshot.contacts = snapshot.contacts
+    .filter((contact) => !isProjectContact(contact.id))
+    .concat(projectFolders.map(projectFolderContact));
 }
 
 function refreshIcons(): void {
@@ -561,6 +777,7 @@ function terminalWorkspace(
   if (!workspace && create) {
     workspace = {
       contactId,
+      projectFolder: projectFolderForContact(contactId),
       layout: null,
       activePaneId: null,
       nextPaneId: 1,
@@ -925,6 +1142,32 @@ function handleTerminalPaneExit(
   }
 }
 
+function cacheProjectFolderResolution(
+  workspace: TerminalWorkspace,
+  location: ProjectFolderLocation,
+): void {
+  const folder = workspace.projectFolder;
+  const cache = projectLaunchCache(location);
+  if (!folder || !cache) return;
+  const current = projectFolders.find((item) => item.id === folder.id);
+  if (!current) return;
+
+  const updated: ProjectFolder = {
+    ...current,
+    path: location.path,
+    ...cache,
+  };
+  try {
+    saveProjectFolders(projectFolders.map((item) => item.id === updated.id ? updated : item));
+  } catch {
+    return;
+  }
+  workspace.projectFolder = updated;
+  syncProjectFolderContacts();
+  renderContacts();
+  if (snapshot.activeContactId === workspace.contactId) renderChatHeader();
+}
+
 async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
   if (!isTauriRuntime() || pane.disposed || pane.sessionId) return;
   if (pane.openPromise) return pane.openPromise;
@@ -943,7 +1186,7 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
   opening = (async () => {
     const rows = Math.max(1, pane.terminal.rows || 24);
     const cols = Math.max(2, pane.terminal.cols || 80);
-    const sessionId = await backend.openPty(
+    const opened = await backend.openPty(
       rows,
       cols,
       (data) => {
@@ -957,17 +1200,19 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
         if (returnedSessionId === null) earlyExit = exit;
         else handleTerminalPaneExit(pane, generation, exit);
       },
+      pane.workspace.projectFolder ?? undefined,
     );
-    returnedSessionId = sessionId;
+    returnedSessionId = opened.sessionId;
     if (
       pane.disposed ||
       pane.generation !== generation ||
       pane.workspace.panes.get(pane.id) !== pane
     ) {
-      await backend.closePty(sessionId);
+      await backend.closePty(opened.sessionId);
       return;
     }
-    pane.sessionId = sessionId;
+    pane.sessionId = opened.sessionId;
+    if (opened.project) cacheProjectFolderResolution(pane.workspace, opened.project);
     pane.state = "connected";
     updateTerminalPaneVisual(pane);
     resizeTerminalPaneToFit(pane);
@@ -1012,7 +1257,11 @@ function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): vo
         continue;
       }
       void backend
-        .executeTerminal(command, pane.workspace.contactId)
+        .executeTerminal(
+          command,
+          pane.workspace.contactId,
+          pane.workspace.projectFolder?.path,
+        )
         .then((execution) => {
           if (!pane.disposed) {
             pane.terminal.write(
@@ -1176,7 +1425,10 @@ function mountTerminalPane(pane: TerminalPaneRuntime): void {
   pane.resizeObserver = new ResizeObserver(() => scheduleTerminalFit(pane.workspace));
   pane.resizeObserver.observe(pane.surface);
   if (!isTauriRuntime()) {
-    pane.terminal.write("Retro Messenger WSL 终端预览\r\n输入 help 查看模拟 Linux 命令。\r\nwsl$ ");
+    const projectLine = pane.workspace.projectFolder
+      ? `项目目录：${pane.workspace.projectFolder.path}\r\n`
+      : "";
+    pane.terminal.write(`Retro Messenger WSL 终端预览\r\n${projectLine}输入 help 查看模拟 Linux 命令。\r\nwsl$ `);
   }
   resizeTerminalPaneToFit(pane);
 }
@@ -1257,6 +1509,19 @@ async function disposeTerminalPane(
   pane.sessionId = null;
   pane.terminal.dispose();
   if (sessionId) await backend.closePty(sessionId);
+}
+
+async function disposeTerminalWorkspace(contactId: string): Promise<void> {
+  const workspace = terminalWorkspaces.get(contactId);
+  if (!workspace) return;
+  if (workspace.fitFrame !== null) cancelAnimationFrame(workspace.fitFrame);
+  workspace.fitFrame = null;
+  const panes = [...workspace.panes.values()];
+  workspace.panes.clear();
+  workspace.layout = null;
+  workspace.activePaneId = null;
+  terminalWorkspaces.delete(contactId);
+  await Promise.all(panes.map((pane) => disposeTerminalPane(pane)));
 }
 
 async function closeTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
@@ -1501,6 +1766,7 @@ function filteredContacts(): Contact[] {
 
   const normalized = filterText.trim().toLocaleLowerCase();
   const filtered = snapshot.contacts.filter((contact) => {
+    if (isProjectContact(contact.id)) return false;
     if (!normalized) return true;
     return `${contact.displayName} ${contact.account} ${contact.statusMessage}`
       .toLocaleLowerCase()
@@ -1566,14 +1832,118 @@ function contactRow(contact: Contact): HTMLButtonElement {
   return button;
 }
 
+function projectFolderRow(folder: ProjectFolder): HTMLElement {
+  const contactId = projectContactId(folder.id);
+  const wrapper = document.createElement("div");
+  wrapper.className = "project-folder-row-wrap";
+  wrapper.dataset.projectId = folder.id;
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "project-folder-row";
+  if (contactId === snapshot.activeContactId) button.classList.add("selected");
+  button.dataset.projectId = folder.id;
+  button.setAttribute("role", "option");
+  button.setAttribute("aria-selected", String(contactId === snapshot.activeContactId));
+  button.title = folder.path;
+
+  const folderIcon = document.createElement("span");
+  folderIcon.className = "project-folder-icon";
+  folderIcon.innerHTML = icon(contactId === snapshot.activeContactId ? "FolderOpen" : "Folder", 22);
+  const copy = document.createElement("span");
+  copy.className = "project-folder-copy";
+  const name = document.createElement("strong");
+  name.textContent = folder.name;
+  const path = document.createElement("span");
+  path.textContent = folder.path;
+  copy.append(name, path);
+  button.append(folderIcon, copy);
+  button.addEventListener("click", () => void selectProjectFolder(folder.id));
+
+  const menuButton = document.createElement("button");
+  menuButton.type = "button";
+  menuButton.className = "project-row-menu";
+  menuButton.title = "项目菜单";
+  menuButton.setAttribute("aria-label", `${folder.name}的项目菜单`);
+  menuButton.setAttribute("aria-haspopup", "menu");
+  menuButton.innerHTML = icon("MoreHorizontal", 16);
+  menuButton.addEventListener("click", () => showProjectFolderMenu(folder, menuButton));
+
+  const openContextMenu = (event: MouseEvent | KeyboardEvent) => {
+    event.preventDefault();
+    button.focus();
+    if (event instanceof MouseEvent) {
+      showProjectFolderMenu(folder, button, event.clientX, event.clientY);
+    } else {
+      showProjectFolderMenu(folder, button);
+    }
+  };
+  wrapper.addEventListener("contextmenu", openContextMenu);
+  button.addEventListener("keydown", (event) => {
+    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+      openContextMenu(event);
+    }
+  });
+  wrapper.append(button, menuButton);
+  return wrapper;
+}
+
+function renderProjectFolders(): void {
+  const groupName = "项目文件夹";
+  const groupRow = document.createElement("div");
+  groupRow.className = "group-header-row project-group-header";
+  const groupButton = document.createElement("button");
+  groupButton.type = "button";
+  groupButton.className = "group-header";
+  const collapsed = collapsedGroups.has(groupName);
+  groupButton.setAttribute("aria-expanded", String(!collapsed));
+  groupButton.innerHTML = `<span class="tree-arrow">${collapsed ? "▶" : "▼"}</span><span>${groupName}</span><em>${projectFolders.length}</em>`;
+  groupButton.addEventListener("click", () => {
+    if (collapsed) collapsedGroups.delete(groupName);
+    else collapsedGroups.add(groupName);
+    renderContacts();
+  });
+
+  const addButton = document.createElement("button");
+  addButton.type = "button";
+  addButton.id = "add-project-folder";
+  addButton.className = "group-add-terminal group-add-project";
+  addButton.title = "添加项目文件夹";
+  addButton.setAttribute("aria-label", "添加项目文件夹");
+  addButton.innerHTML = icon("Plus", 13);
+  addButton.addEventListener("click", openProjectFolderDialog);
+  groupRow.append(groupButton, addButton);
+  contactList.append(groupRow);
+
+  if (collapsed) return;
+  const normalized = filterText.trim().toLocaleLowerCase();
+  const folders = projectFolders.filter((folder) => {
+    if (!normalized) return true;
+    return `${folder.name} ${folder.path}`.toLocaleLowerCase().includes(normalized);
+  });
+  if (folders.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty-roster project-empty-roster";
+    empty.textContent = projectFolders.length === 0 ? "暂无项目文件夹" : "没有找到项目文件夹";
+    contactList.append(empty);
+    return;
+  }
+  folders.forEach((folder) => contactList.append(projectFolderRow(folder)));
+}
+
 function renderContacts(): void {
   contactList.replaceChildren();
+  if (activeTab === "groups") {
+    renderProjectFolders();
+    refreshIcons();
+    return;
+  }
   const contacts = filteredContacts();
 
   if (contacts.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-roster";
-    empty.textContent = activeTab === "groups" ? "暂无群组" : "没有找到联系人";
+    empty.textContent = "没有找到联系人";
     contactList.append(empty);
     return;
   }
@@ -1585,7 +1955,7 @@ function renderContacts(): void {
 
   const grouped = new Map<string, Contact[]>();
   contacts.forEach((contact) => {
-    const groupName = activeTab === "groups" ? `群组 · ${contact.group}` : contact.group;
+    const groupName = contact.group;
     const items = grouped.get(groupName) ?? [];
     items.push(contact);
     grouped.set(groupName, items);
@@ -1629,24 +1999,33 @@ function renderContacts(): void {
 function renderChatHeader(): void {
   const contact = getActiveContact();
   const terminalMode = isTerminalContact(contact.id);
+  const projectFolder = projectFolderForContact(contact.id);
   chatPane.classList.toggle("terminal-mode", terminalMode);
   terminalHost.hidden = !terminalMode;
   transcript.hidden = terminalMode;
   query("#chat-contact-name").textContent = contact.displayName;
-  query("#chat-presence").textContent = terminalMode
-    ? "[WSL]"
-    : `[${presenceText[contact.presence]}]`;
+  query("#chat-presence").textContent = projectFolder
+    ? "[项目]"
+    : terminalMode
+      ? "[WSL]"
+      : `[${presenceText[contact.presence]}]`;
   query("#chat-account").textContent = contact.account;
-  query("#chat-signature").textContent = terminalMode
-    ? "WSL2 默认发行版 · 支持 ANSI、交互程序与 Codex 流式输出"
-    : contact.statusMessage;
-  query("#conversation-caption").textContent = terminalMode
-    ? "WSL 终端会话"
-    : `正在与 ${contact.displayName} 交谈`;
+  query("#chat-signature").textContent = projectFolder
+    ? "项目文件夹 · WSL 终端从此目录启动"
+    : terminalMode
+      ? "WSL2 默认发行版 · 支持 ANSI、交互程序与 Codex 流式输出"
+      : contact.statusMessage;
+  query("#conversation-caption").textContent = projectFolder
+    ? "项目终端会话"
+    : terminalMode
+      ? "WSL 终端会话"
+      : `正在与 ${contact.displayName} 交谈`;
   query<HTMLElement>("#terminal-badge").hidden = !terminalMode;
+  query("#terminal-badge span").textContent = projectFolder ? "PROJECT SHELL" : "WSL SHELL";
   document.querySelectorAll<HTMLElement>(".terminal-only-control").forEach((control) => {
     control.hidden = !terminalMode;
   });
+  query<HTMLElement>("#terminal-rename").hidden = !terminalMode || Boolean(projectFolder);
   query(".format-hint").textContent = terminalMode ? "UTF-8 WSL 输入" : "纯文本";
   query("#send-button span").textContent = terminalMode ? "输入(T)" : "发送(S)";
   messageInput.placeholder = terminalMode
@@ -1786,8 +2165,228 @@ function replaceContact(updated: Contact): void {
   if (updated.id === snapshot.currentUser.id) snapshot.currentUser = updated;
 }
 
+function openProjectFolderDialog(): void {
+  projectFolderPathInput.value = "";
+  projectFolderError.textContent = "";
+  projectFolderSubmit.disabled = false;
+  popupMenu.hidden = true;
+  projectFolderDialog.hidden = false;
+  requestAnimationFrame(() => projectFolderPathInput.focus());
+}
+
+function closeProjectFolderDialog(restoreFocus = true): void {
+  projectFolderDialog.hidden = true;
+  projectFolderPathInput.value = "";
+  projectFolderError.textContent = "";
+  projectFolderSubmit.disabled = false;
+  if (restoreFocus) document.querySelector<HTMLButtonElement>("#add-project-folder")?.focus();
+}
+
+async function selectProjectFolder(projectId: string): Promise<void> {
+  const selectionSequence = ++contactSelectionSequence;
+  const folder = projectFolders.find((item) => item.id === projectId);
+  if (!folder) {
+    showToast("项目文件夹记录不存在");
+    return;
+  }
+  const contactId = projectContactId(projectId);
+  if (!snapshot.contacts.some((contact) => contact.id === contactId)) {
+    snapshot.contacts.push(projectFolderContact(folder));
+  }
+  await selectContact(contactId, selectionSequence);
+}
+
+async function addProjectFolder(): Promise<void> {
+  const requestedPath = projectFolderPathInput.value.trim();
+  if (!requestedPath) {
+    projectFolderError.textContent = "请输入项目文件夹路径";
+    projectFolderPathInput.focus();
+    return;
+  }
+  projectFolderSubmit.disabled = true;
+  projectFolderError.textContent = "";
+  try {
+    const location = await backend.parseProjectFolder(requestedPath);
+    const launchCache = parsedProjectLaunchCache(location);
+    const locationKey = projectPathKey(location.path);
+    const existing = projectFolders.find((folder) => projectPathKey(folder.path) === locationKey);
+    if (existing) {
+      const updated: ProjectFolder = {
+        ...existing,
+        path: location.path,
+        ...(launchCache ?? {}),
+      };
+      saveProjectFolders(projectFolders.map((folder) => folder.id === updated.id ? updated : folder));
+      syncProjectFolderContacts();
+      filterText = "";
+      query<HTMLInputElement>("#contact-search").value = "";
+      closeProjectFolderDialog(false);
+      setTab("groups");
+      await selectProjectFolder(updated.id);
+      showToast("该项目文件夹已在群组中，正在打开终端");
+      return;
+    }
+    const folder: ProjectFolder = {
+      id: createProjectFolderId(),
+      name: location.name,
+      path: location.path,
+      ...(launchCache ?? {}),
+    };
+    saveProjectFolders([...projectFolders, folder]);
+    syncProjectFolderContacts();
+    filterText = "";
+    query<HTMLInputElement>("#contact-search").value = "";
+    collapsedGroups.delete("项目文件夹");
+    closeProjectFolderDialog(false);
+    setTab("groups");
+    await selectProjectFolder(folder.id);
+    showToast(`已添加项目“${folder.name}”，正在打开终端`);
+  } catch (error) {
+    projectFolderError.textContent = error instanceof Error ? error.message : "无法添加项目文件夹";
+    projectFolderPathInput.focus();
+  } finally {
+    projectFolderSubmit.disabled = false;
+  }
+}
+
+function showProjectFolderMenu(
+  folder: ProjectFolder,
+  anchor: HTMLElement,
+  clientX?: number,
+  clientY?: number,
+): void {
+  const items: MenuItem[] = [
+    { label: "修改项目名称", action: () => openProjectRenameDialog(folder.id) },
+    { separator: true, label: "" },
+    { label: "移除", action: () => openProjectRemovalDialog(folder.id) },
+  ];
+  if (clientX !== undefined && clientY !== undefined) showPopupAt(clientX, clientY, items);
+  else showPopup(anchor, items);
+}
+
+function projectFolderRowButton(projectId: string): HTMLButtonElement | null {
+  return contactList.querySelector<HTMLButtonElement>(
+    `.project-folder-row[data-project-id="${CSS.escape(projectId)}"]`,
+  );
+}
+
+function normalizeProjectFolderName(input: string): string {
+  const name = input.trim();
+  if (!name) throw new Error("项目名称不能为空");
+  if ([...name].length > 64) throw new Error("项目名称不能超过 64 个字符");
+  if (/[\u0000-\u001f\u007f]/.test(name)) throw new Error("项目名称包含不支持的控制字符");
+  return name;
+}
+
+function openProjectRenameDialog(projectId: string): void {
+  const folder = projectFolders.find((item) => item.id === projectId);
+  if (!folder) return;
+  renamingProjectId = projectId;
+  projectNameInput.value = folder.name;
+  projectRenameError.textContent = "";
+  popupMenu.hidden = true;
+  projectRenameDialog.hidden = false;
+  requestAnimationFrame(() => {
+    projectNameInput.focus();
+    projectNameInput.select();
+  });
+}
+
+function closeProjectRenameDialog(restoreFocus = true): void {
+  const projectId = renamingProjectId;
+  projectRenameDialog.hidden = true;
+  projectNameInput.value = "";
+  projectRenameError.textContent = "";
+  renamingProjectId = null;
+  if (!restoreFocus || !projectId) return;
+  (projectFolderRowButton(projectId)
+    ?? document.querySelector<HTMLButtonElement>("#add-project-folder"))?.focus();
+}
+
+function renameProjectFolder(): void {
+  const projectId = renamingProjectId;
+  const folder = projectFolders.find((item) => item.id === projectId);
+  if (!projectId || !folder) {
+    closeProjectRenameDialog(false);
+    return;
+  }
+
+  try {
+    const name = normalizeProjectFolderName(projectNameInput.value);
+    saveProjectFolders(projectFolders.map((item) => (
+      item.id === projectId ? { ...item, name } : item
+    )));
+    const contactId = projectContactId(projectId);
+    const active = snapshot.activeContactId === contactId;
+    closeProjectRenameDialog(false);
+    syncProjectFolderContacts();
+    renderContacts();
+    if (active) {
+      renderChatHeader();
+      updateTerminalConnectionStatus();
+    }
+    (projectFolderRowButton(projectId)
+      ?? document.querySelector<HTMLButtonElement>("#add-project-folder"))?.focus();
+    showToast(`已将项目重命名为“${name}”`);
+  } catch (error) {
+    projectRenameError.textContent = error instanceof Error ? error.message : "无法修改项目名称";
+    projectNameInput.focus();
+  }
+}
+
+function openProjectRemovalDialog(projectId: string): void {
+  const folder = projectFolders.find((item) => item.id === projectId);
+  if (!folder) return;
+  pendingProjectRemovalId = projectId;
+  query("#project-remove-name").textContent = folder.name;
+  query("#project-remove-path").textContent = folder.path;
+  popupMenu.hidden = true;
+  projectRemoveDialog.hidden = false;
+  query<HTMLButtonElement>("#project-remove-cancel").focus();
+}
+
+function closeProjectRemovalDialog(restoreFocus = true): void {
+  const projectId = pendingProjectRemovalId;
+  projectRemoveDialog.hidden = true;
+  pendingProjectRemovalId = null;
+  if (!restoreFocus || !projectId) return;
+  const row = projectFolderRowButton(projectId);
+  (row ?? document.querySelector<HTMLButtonElement>("#add-project-folder"))?.focus();
+}
+
+async function confirmProjectRemoval(): Promise<void> {
+  const projectId = pendingProjectRemovalId;
+  const folder = projectFolders.find((item) => item.id === projectId);
+  if (!projectId || !folder) {
+    closeProjectRemovalDialog(false);
+    return;
+  }
+  const contactId = projectContactId(projectId);
+  const next = projectFolders.filter((item) => item.id !== projectId);
+  try {
+    saveProjectFolders(next);
+  } catch {
+    showToast("无法保存项目文件夹列表");
+    return;
+  }
+  closeProjectRemovalDialog(false);
+
+  if (snapshot.activeContactId === contactId) {
+    const fallback = snapshot.contacts.find((contact) => !isProjectContact(contact.id));
+    if (fallback) await selectContact(fallback.id);
+  }
+  await disposeTerminalWorkspace(contactId);
+  messageDrafts.delete(contactId);
+  syncProjectFolderContacts();
+  renderContacts();
+  const focusTarget = contactList.querySelector<HTMLButtonElement>(".project-folder-row")
+    ?? document.querySelector<HTMLButtonElement>("#add-project-folder");
+  focusTarget?.focus();
+  showToast(`已从群组移除“${folder.name}”`);
+}
+
 function openRenameTerminal(contactId = snapshot.activeContactId): void {
-  if (!isTerminalContact(contactId)) return;
+  if (!isTerminalContact(contactId) || isProjectContact(contactId)) return;
   const contact = snapshot.contacts.find((item) => item.id === contactId);
   if (!contact) return;
   renamingTerminalId = contactId;
@@ -1859,7 +2458,11 @@ async function addTerminalContact(): Promise<void> {
   }
 }
 
-async function selectContact(contactId: string): Promise<void> {
+async function selectContact(
+  contactId: string,
+  selectionSequence = ++contactSelectionSequence,
+): Promise<void> {
+  if (selectionSequence !== contactSelectionSequence) return;
   if (contactId === snapshot.activeContactId && shell.classList.contains("show-chat")) {
     if (isTerminalContact(contactId)) {
       ensureTerminal();
@@ -1873,12 +2476,20 @@ async function selectContact(contactId: string): Promise<void> {
   shell.classList.add("show-chat");
   renderContacts();
   renderChatHeader();
+  if (isProjectContact(contactId)) {
+    messages = [];
+    renderMessages(true);
+    updateTerminalConnectionStatus();
+    activeTerminalPane()?.terminal.focus();
+    return;
+  }
   query("#connection-status").textContent = "正在读取聊天记录...";
   try {
     const [conversation, contact] = await Promise.all([
       backend.getConversation(contactId),
       backend.markRead(contactId),
     ]);
+    if (selectionSequence !== contactSelectionSequence) return;
     messages = conversation;
     replaceContact(contact);
     renderContacts();
@@ -1891,9 +2502,11 @@ async function selectContact(contactId: string): Promise<void> {
       messageInput.focus();
     }
   } catch (error) {
-    showToast(error instanceof Error ? error.message : "读取会话失败");
+    if (selectionSequence === contactSelectionSequence) {
+      showToast(error instanceof Error ? error.message : "读取会话失败");
+    }
   }
-  updateTypingStatus();
+  if (selectionSequence === contactSelectionSequence) updateTypingStatus();
 }
 
 async function scheduleReply(contactId: string): Promise<void> {
@@ -1982,11 +2595,17 @@ async function sendCurrentMessage(overrideText?: string): Promise<void> {
 
 function setTab(tab: RosterTab): void {
   activeTab = tab;
+  popupMenu.hidden = true;
   document.querySelectorAll<HTMLButtonElement>(".roster-tab").forEach((button) => {
     const active = button.dataset.tab === tab;
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", String(active));
   });
+  const search = query<HTMLInputElement>("#contact-search");
+  const projectMode = tab === "groups";
+  search.placeholder = projectMode ? "查找项目文件夹" : "查找联系人";
+  search.setAttribute("aria-label", search.placeholder);
+  query<HTMLButtonElement>("#add-contact").hidden = projectMode;
   renderContacts();
 }
 
@@ -2011,7 +2630,7 @@ async function setUserPresence(presence: Presence): Promise<void> {
 
 type MenuItem = { label: string; action?: () => void; disabled?: boolean; separator?: boolean };
 
-function showPopup(anchor: HTMLElement, items: MenuItem[]): void {
+function fillPopup(items: MenuItem[]): void {
   popupMenu.replaceChildren();
   items.forEach((item) => {
     if (item.separator) {
@@ -2033,6 +2652,17 @@ function showPopup(anchor: HTMLElement, items: MenuItem[]): void {
   });
   popupMenu.hidden = false;
   popupMenu.style.visibility = "hidden";
+}
+
+function finishPopupPosition(left: number, top: number): void {
+  popupMenu.style.left = `${left}px`;
+  popupMenu.style.top = `${top}px`;
+  popupMenu.style.visibility = "visible";
+  popupMenu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+}
+
+function showPopup(anchor: HTMLElement, items: MenuItem[]): void {
+  fillPopup(items);
 
   const anchorRect = anchor.getBoundingClientRect();
   const menuRect = popupMenu.getBoundingClientRect();
@@ -2042,9 +2672,15 @@ function showPopup(anchor: HTMLElement, items: MenuItem[]): void {
     ? preferredTop
     : Math.max(3, anchorRect.top - menuRect.height);
 
-  popupMenu.style.left = `${left}px`;
-  popupMenu.style.top = `${top}px`;
-  popupMenu.style.visibility = "visible";
+  finishPopupPosition(left, top);
+}
+
+function showPopupAt(clientX: number, clientY: number, items: MenuItem[]): void {
+  fillPopup(items);
+  const menuRect = popupMenu.getBoundingClientRect();
+  const left = Math.max(3, Math.min(clientX, window.innerWidth - menuRect.width - 3));
+  const top = Math.max(3, Math.min(clientY, window.innerHeight - menuRect.height - 3));
+  finishPopupPosition(left, top);
 }
 
 function toggleSound(): void {
@@ -2263,7 +2899,7 @@ function bindEvents(): void {
   });
   contactList.addEventListener("keydown", (event) => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-    const rows = [...contactList.querySelectorAll<HTMLButtonElement>(".contact-row")];
+    const rows = [...contactList.querySelectorAll<HTMLButtonElement>(".contact-row, .project-folder-row")];
     const current = document.activeElement as HTMLButtonElement;
     const index = rows.indexOf(current);
     const change = event.key === "ArrowDown" ? 1 : -1;
@@ -2329,6 +2965,30 @@ function bindEvents(): void {
   terminalRenameDialog.addEventListener("click", (event) => {
     if (event.target === terminalRenameDialog) closeRenameTerminal();
   });
+  query("#project-folder-close").addEventListener("click", () => closeProjectFolderDialog());
+  query("#project-folder-cancel").addEventListener("click", () => closeProjectFolderDialog());
+  query<HTMLFormElement>("#project-folder-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    void addProjectFolder();
+  });
+  projectFolderDialog.addEventListener("click", (event) => {
+    if (event.target === projectFolderDialog) closeProjectFolderDialog();
+  });
+  query("#project-rename-close").addEventListener("click", () => closeProjectRenameDialog());
+  query("#project-rename-cancel").addEventListener("click", () => closeProjectRenameDialog());
+  query<HTMLFormElement>("#project-rename-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    renameProjectFolder();
+  });
+  projectRenameDialog.addEventListener("click", (event) => {
+    if (event.target === projectRenameDialog) closeProjectRenameDialog();
+  });
+  query("#project-remove-close").addEventListener("click", () => closeProjectRemovalDialog());
+  query("#project-remove-cancel").addEventListener("click", () => closeProjectRemovalDialog());
+  query("#project-remove-confirm").addEventListener("click", () => void confirmProjectRemoval());
+  projectRemoveDialog.addEventListener("click", (event) => {
+    if (event.target === projectRemoveDialog) closeProjectRemovalDialog();
+  });
   aboutDialog.addEventListener("click", (event) => {
     if (event.target === aboutDialog) closeAbout();
   });
@@ -2337,7 +2997,7 @@ function bindEvents(): void {
   });
   document.addEventListener("pointerdown", (event) => {
     if (!popupMenu.hidden && !popupMenu.contains(event.target as Node)) {
-      const trigger = (event.target as Element).closest(".menu-trigger, #settings-button, #presence-trigger, #send-options");
+      const trigger = (event.target as Element).closest(".menu-trigger, #settings-button, #presence-trigger, #send-options, .project-row-menu");
       if (!trigger) popupMenu.hidden = true;
     }
   });
@@ -2362,6 +3022,9 @@ function bindEvents(): void {
     if (event.key === "Escape") {
       popupMenu.hidden = true;
       if (!terminalRenameDialog.hidden) closeRenameTerminal();
+      if (!projectFolderDialog.hidden) closeProjectFolderDialog();
+      if (!projectRenameDialog.hidden) closeProjectRenameDialog();
+      if (!projectRemoveDialog.hidden) closeProjectRemovalDialog();
       if (!avatarDialog.hidden) closeAvatarDialog();
       closeAbout();
     }
@@ -2388,6 +3051,7 @@ async function start(): Promise<void> {
   window.setInterval(updateClock, 1000);
   try {
     snapshot = await backend.bootstrap();
+    syncProjectFolderContacts();
     messages = snapshot.messages.filter(
       (message) => message.contactId === snapshot.activeContactId,
     );

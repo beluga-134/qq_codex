@@ -1,6 +1,22 @@
 export type Presence = "online" | "away" | "busy" | "offline";
 
 export const TERMINAL_CONTACT_ID = "terminal";
+export const PROJECT_CONTACT_PREFIX = "project-folder:";
+
+export interface ProjectFolder {
+  id: string;
+  name: string;
+  path: string;
+  wslPath?: string;
+  wslDistribution?: string | null;
+}
+
+export interface ProjectFolderLocation {
+  name: string;
+  path: string;
+  wslPath: string;
+  wslDistribution: string | null;
+}
 
 export interface Contact {
   id: string;

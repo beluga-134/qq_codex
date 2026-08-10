@@ -6,6 +6,8 @@ import {
   type Contact,
   type Message,
   type Presence,
+  type ProjectFolder,
+  type ProjectFolderLocation,
   type TerminalExecution,
 } from "./types";
 
@@ -14,6 +16,11 @@ export interface PtyExit {
   exitCode: number | null;
   signal: string | null;
   error: string | null;
+}
+
+export interface PtyOpenResult {
+  sessionId: number;
+  project: ProjectFolderLocation | null;
 }
 
 export type PtyData = ArrayBuffer | Uint8Array | number[];
@@ -228,6 +235,122 @@ function normalizeTerminalName(displayName: string): string {
   return normalized;
 }
 
+interface PreviewResolvedProjectFolder {
+  location: ProjectFolderLocation;
+}
+
+function isValidWindowsComponent(component: string): boolean {
+  return Boolean(component)
+    && component !== "."
+    && component !== ".."
+    && !/[\u0000-\u001f\u007f<>:"|?*]/.test(component)
+    && !/[. ]$/.test(component);
+}
+
+function normalizeProjectPathComponents(input: string, windowsRules: boolean): string[] {
+  const components: string[] = [];
+  input.split(/[\\/]+/).forEach((component) => {
+    if (!component || component === ".") return;
+    if (component === "..") {
+      if (!components.pop()) throw new Error("项目路径不能越过根目录");
+      return;
+    }
+    if (/[\u0000-\u001f\u007f]/.test(component)) {
+      throw new Error("项目路径包含不支持的控制字符");
+    }
+    if (windowsRules && !isValidWindowsComponent(component)) {
+      throw new Error("项目路径包含 Windows 不支持的字符");
+    }
+    components.push(component);
+  });
+  return components;
+}
+
+function resolvePreviewProjectPath(input: string): PreviewResolvedProjectFolder {
+  const value = input.trim();
+  if (!value) throw new Error("请输入项目文件夹路径");
+  if ([...value].length > 1024) throw new Error("项目路径不能超过 1024 个字符");
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("项目路径包含不支持的控制字符");
+  }
+
+  const driveMatch = /^([a-z]):[\\/](.*)$/i.exec(value);
+  if (driveMatch) {
+    const drive = driveMatch[1]!.toUpperCase();
+    const components = normalizeProjectPathComponents(driveMatch[2] ?? "", true);
+    const path = components.length > 0 ? `${drive}:\\${components.join("\\")}` : `${drive}:\\`;
+    return {
+      location: {
+        name: components.at(-1) ?? `${drive} 盘`,
+        path,
+        wslPath: components.length > 0
+          ? `/mnt/${drive.toLowerCase()}/${components.join("/")}`
+          : `/mnt/${drive.toLowerCase()}`,
+        wslDistribution: null,
+      },
+    };
+  }
+  if (/^[^\\/]:/.test(value)) {
+    throw new Error("Windows 项目路径必须是盘符绝对路径，例如 C:\\workspace\\project");
+  }
+
+  if (/^(?:\\\\|\/\/)/.test(value)) {
+    const components = value.replace(/^[\\/]+/, "").split(/[\\/]+/).filter(Boolean);
+    if (components.length < 2) throw new Error("UNC 项目路径必须包含服务器和共享名称");
+    const [rawServer, share, ...rest] = components as [string, string, ...string[]];
+    const isWslUnc = /^(?:wsl\.localhost|wsl\$)$/i.test(rawServer);
+    if (isWslUnc) {
+      if (!isValidWindowsComponent(share)) throw new Error("WSL 发行版名称无效");
+      const linuxComponents = normalizeProjectPathComponents(rest.join("/"), false);
+      const server = rawServer.toLowerCase() === "wsl.localhost" ? "wsl.localhost" : "wsl$";
+      const path = `\\\\${server}\\${share}${linuxComponents.length ? `\\${linuxComponents.join("\\")}` : ""}`;
+      return {
+        location: {
+          name: linuxComponents.at(-1) ?? share,
+          path,
+          wslPath: linuxComponents.length ? `/${linuxComponents.join("/")}` : "/",
+          wslDistribution: share,
+        },
+      };
+    }
+
+    if (!isValidWindowsComponent(rawServer) || !isValidWindowsComponent(share)) {
+      throw new Error("UNC 项目路径的服务器或共享名称无效");
+    }
+    const pathComponents = normalizeProjectPathComponents(rest.join("/"), true);
+    const path = `\\\\${rawServer}\\${share}${pathComponents.length ? `\\${pathComponents.join("\\")}` : ""}`;
+    const wslPath = `/mnt/unc/${[rawServer, share, ...pathComponents].join("/")}`;
+    return {
+      location: {
+        name: pathComponents.at(-1) ?? share,
+        path,
+        wslPath,
+        wslDistribution: null,
+      },
+    };
+  }
+
+  const components = normalizeProjectPathComponents(value, false);
+  const path = components.length ? `/${components.join("/")}` : "/";
+  return {
+    location: {
+      name: components.at(-1) ?? "/",
+      path,
+      wslPath: path,
+      wslDistribution: null,
+    },
+  };
+}
+
+function resolvePreviewProjectFolder(input: string): ProjectFolderLocation {
+  return resolvePreviewProjectPath(input).location;
+}
+
+function previewWslPath(projectPath?: string): string {
+  if (!projectPath) return "/mnt/e/qq_codex/qq_codex";
+  return resolvePreviewProjectPath(projectPath).location.wslPath;
+}
+
 function mockReply(contact: Contact, lastText: string): string {
   if (contact.id === "service") {
     return "您好，这里是 OICQ 服务台。当前线路畅通，消息已成功送达。";
@@ -248,10 +371,10 @@ function mockReply(contact: Contact, lastText: string): string {
 function mockTerminalExecution(
   command: string,
   contactId = TERMINAL_CONTACT_ID,
+  projectPath?: string,
 ): TerminalExecution {
-  const mockProjectRoot = "/mnt/e/qq_codex/qq_codex";
+  const mockProjectRoot = previewWslPath(projectPath);
   const terminalContact = mockContacts.find((contact) => contact.id === contactId);
-  if (!terminalContact) throw new Error("终端不存在");
   const normalized = command.trim();
   const commandMessage: Message = {
     id: mockMessageId++,
@@ -284,7 +407,7 @@ function mockTerminalExecution(
     id: mockMessageId++,
     contactId,
     senderId: contactId,
-    senderName: terminalContact.displayName,
+    senderName: terminalContact?.displayName ?? "项目终端",
     text: output || "(命令执行完成，没有输出)",
     sentAt: Date.now(),
     outgoing: false,
@@ -294,8 +417,10 @@ function mockTerminalExecution(
   conversation.push(commandMessage, outputMessage);
   mockMessages.set(contactId, conversation);
   mockActiveContact = contactId;
-  terminalContact.lastMessage = outputMessage.text;
-  terminalContact.lastMessageAt = outputMessage.sentAt;
+  if (terminalContact) {
+    terminalContact.lastMessage = outputMessage.text;
+    terminalContact.lastMessageAt = outputMessage.sentAt;
+  }
   return {
     commandMessage: clone(commandMessage),
     outputMessage: clone(outputMessage),
@@ -420,13 +545,19 @@ export const backend = {
     return clone(contact);
   },
 
+  async parseProjectFolder(path: string): Promise<ProjectFolderLocation> {
+    if (isTauri()) return invoke<ProjectFolderLocation>("parse_project_folder", { path });
+    return resolvePreviewProjectFolder(path);
+  },
+
   async executeTerminal(
     command: string,
     contactId = TERMINAL_CONTACT_ID,
+    projectPath?: string,
   ): Promise<TerminalExecution> {
     if (isTauri()) return invoke<TerminalExecution>("execute_terminal", { command });
     if (!command.trim()) throw new Error("命令不能为空");
-    return mockTerminalExecution(command, contactId);
+    return mockTerminalExecution(command, contactId, projectPath);
   },
 
   async openPty(
@@ -434,17 +565,21 @@ export const backend = {
     cols: number,
     onData: (data: PtyData) => void,
     onExit: (exit: PtyExit) => void,
-  ): Promise<number> {
-    if (!isTauri()) return 0;
+    project?: ProjectFolder,
+  ): Promise<PtyOpenResult> {
+    if (!isTauri()) return { sessionId: 0, project: null };
     const dataChannel = new Channel<PtyData>();
     dataChannel.onmessage = onData;
     const exitChannel = new Channel<PtyExit>();
     exitChannel.onmessage = onExit;
-    return invoke<number>("pty_open", {
+    return invoke<PtyOpenResult>("pty_open", {
       rows: Math.max(1, Math.round(rows)),
       cols: Math.max(2, Math.round(cols)),
       onData: dataChannel,
       onExit: exitChannel,
+      projectPath: project?.path,
+      projectWslPath: project?.wslPath,
+      projectWslDistribution: project?.wslDistribution ?? undefined,
     });
   },
 

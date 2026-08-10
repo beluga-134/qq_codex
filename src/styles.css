@@ -660,6 +660,19 @@ svg {
   background: #3c7f5f;
 }
 
+.group-add-project {
+  color: #174f91;
+}
+
+.group-add-project:hover {
+  color: #0d3b72;
+}
+
+.group-add-project:active {
+  color: #ffffff;
+  background: var(--selection);
+}
+
 .group-header:hover {
   background: #fff3c8;
 }
@@ -727,6 +740,98 @@ svg {
 .contact-row.offline:not(.selected) .contact-copy,
 .contact-row.offline:not(.selected) .contact-time {
   color: #888888;
+}
+
+.project-folder-row-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 29px;
+  width: 100%;
+  height: 48px;
+  border-bottom: 1px solid #edf0f2;
+  background: #ffffff;
+}
+
+.project-folder-row {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  min-width: 0;
+  height: 47px;
+  padding: 4px 3px 4px 6px;
+  overflow: hidden;
+  background: transparent;
+  text-align: left;
+}
+
+.project-folder-row-wrap:hover:not(:has(.project-folder-row.selected)) {
+  background: #eaf2fb;
+}
+
+.project-folder-row.selected {
+  color: #ffffff;
+  background: var(--selection);
+}
+
+.project-folder-icon {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  color: #b97800;
+}
+
+.project-folder-row.selected .project-folder-icon {
+  color: #fff0a6;
+}
+
+.project-folder-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.project-folder-copy strong,
+.project-folder-copy span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.project-folder-copy strong {
+  color: #184c88;
+  font-size: 12px;
+}
+
+.project-folder-copy span {
+  color: #68727b;
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.project-folder-row.selected .project-folder-copy strong,
+.project-folder-row.selected .project-folder-copy span {
+  color: #ffffff;
+}
+
+.project-row-menu {
+  display: grid;
+  place-items: center;
+  width: 29px;
+  height: 47px;
+  padding: 0;
+  color: #4f6174;
+  background: transparent;
+}
+
+.project-row-menu:hover,
+.project-row-menu:focus-visible {
+  color: #ffffff;
+  background: var(--selection);
+}
+
+.project-empty-roster {
+  padding-top: 23px;
 }
 
 .contact-avatar {
@@ -1789,8 +1894,14 @@ svg {
   color: #555555;
 }
 
-.rename-terminal-dialog {
+.rename-terminal-dialog,
+.project-folder-dialog,
+.project-remove-dialog {
   width: min(340px, calc(100vw - 32px));
+}
+
+.project-folder-dialog {
+  width: min(460px, calc(100vw - 32px));
 }
 
 .avatar-dialog {
@@ -1851,19 +1962,22 @@ svg {
   white-space: normal;
 }
 
-.rename-terminal-body {
+.rename-terminal-body,
+.project-folder-dialog-body {
   display: block;
   padding: 18px 18px 12px;
 }
 
-.rename-terminal-body label {
+.rename-terminal-body label,
+.project-folder-dialog-body label {
   display: block;
   margin-bottom: 5px;
   color: #25384c;
   font-weight: 700;
 }
 
-.rename-terminal-body input {
+.rename-terminal-body input,
+.project-folder-dialog-body input {
   width: 100%;
   height: 25px;
   padding: 2px 5px;
@@ -1874,10 +1988,48 @@ svg {
   box-shadow: inset 1px 1px #d5d5d5;
 }
 
-.rename-terminal-body .dialog-field-error {
+.rename-terminal-body .dialog-field-error,
+.project-folder-dialog-body .dialog-field-error {
   min-height: 16px;
   margin-top: 5px;
   color: #a32218;
+}
+
+.project-remove-dialog {
+  width: min(430px, calc(100vw - 32px));
+}
+
+.project-remove-dialog-body {
+  display: block;
+  padding: 17px 18px 13px;
+}
+
+.project-remove-dialog-body strong,
+.project-remove-dialog-body p {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.project-remove-dialog-body strong {
+  color: #173f72;
+  font-size: 13px;
+}
+
+.project-remove-dialog-body #project-remove-path {
+  margin-top: 5px;
+  color: #4f5962;
+  font-family: var(--mono-font);
+  font-size: 11px;
+}
+
+.project-remove-dialog-body #project-remove-message {
+  margin-top: 13px;
+  color: #7d251b;
+}
+
+.xp-button.danger {
+  color: #8c2118;
+  font-weight: 700;
 }
 
 .dialog-actions {
@@ -2032,6 +2184,20 @@ svg {
 
   .contact-status {
     display: block;
+  }
+
+  .project-group-header,
+  .project-group-header .group-header,
+  .project-group-header .group-add-project {
+    height: 34px;
+  }
+
+  .project-group-header {
+    grid-template-columns: minmax(0, 1fr) 36px;
+  }
+
+  .project-group-header .group-add-project {
+    width: 36px;
   }
 
   .status-bar {
