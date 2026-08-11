@@ -550,6 +550,14 @@ export const backend = {
     return resolvePreviewProjectFolder(path);
   },
 
+  async openProjectFolderInOneCommander(folder: ProjectFolder): Promise<void> {
+    if (!isTauri()) throw new Error("仅 Windows 桌面版支持使用 OneCommander 打开项目文件夹");
+    await invoke<void>("open_project_folder_in_onecommander", {
+      path: folder.path,
+      wslDistribution: folder.wslDistribution ?? undefined,
+    });
+  },
+
   async executeTerminal(
     command: string,
     contactId = TERMINAL_CONTACT_ID,

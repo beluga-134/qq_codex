@@ -1858,7 +1858,14 @@ function projectFolderRow(folder: ProjectFolder): HTMLElement {
   path.textContent = folder.path;
   copy.append(name, path);
   button.append(folderIcon, copy);
-  button.addEventListener("click", () => void selectProjectFolder(folder.id));
+  button.addEventListener("click", (event) => {
+    if (event.detail <= 1) void selectProjectFolder(folder.id);
+  });
+  button.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void openProjectFolderInOneCommander(folder);
+  });
 
   const menuButton = document.createElement("button");
   menuButton.type = "button";
@@ -2196,6 +2203,15 @@ async function selectProjectFolder(projectId: string): Promise<void> {
   await selectContact(contactId, selectionSequence);
 }
 
+async function openProjectFolderInOneCommander(folder: ProjectFolder): Promise<void> {
+  try {
+    await backend.openProjectFolderInOneCommander(folder);
+    showToast(`已在 OneCommander 中打开“${folder.name}”`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "无法使用 OneCommander 打开项目文件夹");
+  }
+}
+
 async function addProjectFolder(): Promise<void> {
   const requestedPath = projectFolderPathInput.value.trim();
   if (!requestedPath) {
@@ -2256,6 +2272,8 @@ function showProjectFolderMenu(
   clientY?: number,
 ): void {
   const items: MenuItem[] = [
+    { label: "在 OneCommander 中打开", action: () => void openProjectFolderInOneCommander(folder) },
+    { separator: true, label: "" },
     { label: "修改项目名称", action: () => openProjectRenameDialog(folder.id) },
     { separator: true, label: "" },
     { label: "移除", action: () => openProjectRemovalDialog(folder.id) },

@@ -860,6 +860,112 @@ fn project_folder_resolution(resolved: ResolvedProjectFolder) -> ProjectFolderRe
     }
 }
 
+fn onecommander_candidate_paths(
+    configured_executable: Option<&Path>,
+    program_files_roots: &[PathBuf],
+    local_app_data: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut push_candidate = |candidate: PathBuf| {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+
+    if let Some(executable) = configured_executable {
+        push_candidate(executable.to_path_buf());
+    }
+    for root in program_files_roots {
+        push_candidate(root.join("OneCommander").join("OneCommander.exe"));
+        push_candidate(root.join("OneCommander V3").join("OneCommander.exe"));
+    }
+    if let Some(root) = local_app_data {
+        push_candidate(root.join("OneCommander").join("OneCommander.exe"));
+        push_candidate(
+            root.join("Programs")
+                .join("OneCommander")
+                .join("OneCommander.exe"),
+        );
+        push_candidate(
+            root.join("Microsoft")
+                .join("WindowsApps")
+                .join("OneCommander.exe"),
+        );
+    }
+
+    // Keep PATH as the final fallback for portable and app-alias installs.
+    push_candidate(PathBuf::from("OneCommander.exe"));
+    candidates
+}
+
+fn onecommander_command(executable: &Path, project_path: &str) -> Command {
+    let mut command = Command::new(executable);
+    command.arg(project_path);
+    command
+}
+
+fn onecommander_project_path<F>(
+    path: &str,
+    wsl_distribution: Option<&str>,
+    convert_wsl_path: F,
+) -> Result<String, String>
+where
+    F: FnOnce(&str, Option<&str>) -> Result<String, String>,
+{
+    let resolved = parse_project_folder_path(path)?;
+    if let Some(windows_path) = resolved.windows_path {
+        return Ok(windows_path);
+    }
+
+    let target = project_shell_target_from_cache(&resolved.wsl_path, wsl_distribution)?;
+    let converted = convert_wsl_path(&target.wsl_path, target.wsl_distribution.as_deref())?;
+    let converted = parse_project_folder_path(&converted)?;
+    converted
+        .windows_path
+        .ok_or_else(|| "WSL 返回的项目路径不是 Windows 资源管理器可访问的绝对路径".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn installed_onecommander_candidates() -> Vec<PathBuf> {
+    let configured = std::env::var_os("ONECOMMANDER_EXE").map(PathBuf::from);
+    let program_files_roots: Vec<PathBuf> = ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect();
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    onecommander_candidate_paths(
+        configured.as_deref(),
+        &program_files_roots,
+        local_app_data.as_deref(),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn launch_onecommander(project_path: &str) -> Result<(), String> {
+    let mut launch_errors = Vec::new();
+    for executable in installed_onecommander_candidates() {
+        let is_path_fallback = executable == Path::new("OneCommander.exe");
+        if !is_path_fallback && !executable.is_file() {
+            continue;
+        }
+        match onecommander_command(&executable, project_path).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) if is_path_fallback && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => launch_errors.push(format!("{}：{error}", executable.display())),
+        }
+    }
+
+    if launch_errors.is_empty() {
+        Err("未找到 OneCommander，请确认已在 Windows 中安装 OneCommander".into())
+    } else {
+        Err(format!(
+            "无法启动 OneCommander：{}",
+            launch_errors.join("；")
+        ))
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn wsl_command(distribution: Option<&str>) -> Command {
     let mut command = Command::new("wsl.exe");
@@ -1268,6 +1374,25 @@ fn parse_project_folder(path: String) -> Result<ProjectFolderResolution, String>
     parse_project_folder_path(&path).map(project_folder_resolution)
 }
 
+#[tauri::command(async)]
+fn open_project_folder_in_onecommander(
+    path: String,
+    wsl_distribution: Option<String>,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let project_path =
+            onecommander_project_path(&path, wsl_distribution.as_deref(), wsl_path_to_windows)?;
+        return launch_onecommander(&project_path);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (path, wsl_distribution);
+        Err("只能在 Windows 版应用中使用 OneCommander 打开项目文件夹".into())
+    }
+}
+
 /// Open a persistent login shell and stream every byte it writes to xterm.js.
 /// `Response` keeps the payload binary, which matters for split UTF-8 sequences
 /// and for terminal protocols such as mouse reporting.
@@ -1537,6 +1662,7 @@ pub fn run() {
             rename_terminal_contact,
             execute_terminal,
             parse_project_folder,
+            open_project_folder_in_onecommander,
             pty_open,
             pty_write,
             pty_resize,
@@ -1722,6 +1848,85 @@ mod tests {
         let drive = parse_project_folder(r#"Z:\definitely-missing\project"#.to_string()).unwrap();
         assert_eq!(drive.path, r#"Z:\definitely-missing\project"#);
         assert_eq!(drive.wsl_path, "/mnt/z/definitely-missing/project");
+    }
+
+    #[test]
+    fn onecommander_candidates_cover_machine_user_and_path_installs() {
+        let configured = PathBuf::from(r"D:\Tools\OneCommander\OneCommander.exe");
+        let program_files = PathBuf::from(r"C:\Program Files");
+        let local_app_data = PathBuf::from(r"C:\Users\tester\AppData\Local");
+        let candidates = onecommander_candidate_paths(
+            Some(&configured),
+            &[program_files.clone(), program_files.clone()],
+            Some(&local_app_data),
+        );
+
+        assert_eq!(candidates[0], configured);
+        assert!(candidates.contains(&program_files.join("OneCommander").join("OneCommander.exe")));
+        assert!(candidates.contains(
+            &local_app_data
+                .join("Programs")
+                .join("OneCommander")
+                .join("OneCommander.exe")
+        ));
+        assert_eq!(candidates.last().unwrap(), Path::new("OneCommander.exe"));
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    **candidate == program_files.join("OneCommander").join("OneCommander.exe")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn onecommander_receives_the_project_path_as_one_argument() {
+        let executable = Path::new(r"C:\Program Files\OneCommander\OneCommander.exe");
+        let project_path = r"\\wsl.localhost\Ubuntu\home\beluga\中文 项目";
+        let command = onecommander_command(executable, project_path);
+        let arguments: Vec<_> = command.get_args().collect();
+
+        assert_eq!(command.get_program(), executable.as_os_str());
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0], project_path);
+    }
+
+    #[test]
+    fn onecommander_project_paths_use_windows_paths_and_convert_wsl_paths() {
+        let windows_path =
+            onecommander_project_path(r"D:\Workspace\中文 项目", None, |_, _| {
+                panic!("Windows paths must not invoke WSL")
+            })
+            .unwrap();
+        assert_eq!(windows_path, r"D:\Workspace\中文 项目");
+
+        let wsl_path = onecommander_project_path(
+            r"home\beluga\project\中文 项目",
+            Some("Ubuntu"),
+            |path, distribution| {
+                assert_eq!(path, "/home/beluga/project/中文 项目");
+                assert_eq!(distribution, Some("Ubuntu"));
+                Ok(r"\\wsl.localhost\Ubuntu\home\beluga\project\中文 项目".to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            wsl_path,
+            r"\\wsl.localhost\Ubuntu\home\beluga\project\中文 项目"
+        );
+
+        assert!(
+            onecommander_project_path("/home/beluga", Some("Ubuntu?"), |_, _| {
+                panic!("an invalid distribution must not be passed to WSL")
+            })
+            .is_err()
+        );
+        assert!(onecommander_project_path("/home/beluga", None, |_, _| {
+            Ok("/still/a/wsl/path".to_string())
+        })
+        .is_err());
     }
 
     #[test]
