@@ -5,10 +5,16 @@ export const PROJECT_CONTACT_PREFIX = "project-folder:";
 
 export interface ProjectFolder {
   id: string;
+  directoryId: string;
   name: string;
   path: string;
   wslPath?: string;
   wslDistribution?: string | null;
+}
+
+export interface ProjectDirectory {
+  id: string;
+  name: string;
 }
 
 export interface ProjectFolderLocation {

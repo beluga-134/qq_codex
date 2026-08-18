@@ -294,6 +294,23 @@ function resolvePreviewProjectPath(input: string): PreviewResolvedProjectFolder 
     throw new Error("Windows 项目路径必须是盘符绝对路径，例如 C:\\workspace\\project");
   }
 
+  if (value === "~" || /^~[\\/]/.test(value)) {
+    const relativeComponents = normalizeProjectPathComponents(value.slice(1), false);
+    const components = ["home", "wsl-user", ...relativeComponents];
+    const path = `/${components.join("/")}`;
+    return {
+      location: {
+        name: relativeComponents.at(-1) ?? "wsl-user",
+        path,
+        wslPath: path,
+        wslDistribution: null,
+      },
+    };
+  }
+  if (value.startsWith("~")) {
+    throw new Error("WSL 用户主目录路径仅支持 ~ 或 ~/...");
+  }
+
   if (/^(?:\\\\|\/\/)/.test(value)) {
     const components = value.replace(/^[\\/]+/, "").split(/[\\/]+/).filter(Boolean);
     if (components.length < 2) throw new Error("UNC 项目路径必须包含服务器和共享名称");

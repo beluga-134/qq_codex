@@ -673,6 +673,79 @@ svg {
   background: var(--selection);
 }
 
+.project-directory-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 27px;
+  align-items: center;
+  min-height: 29px;
+  padding-left: 7px;
+  border-bottom: 1px solid #b9cbd8;
+  color: #2b4058;
+  background: #eef4f8;
+}
+
+.project-directory-toolbar strong {
+  font-size: 11px;
+}
+
+.project-directory-toolbar span {
+  min-width: 18px;
+  color: #6b7885;
+  text-align: center;
+}
+
+.project-directory-toolbar button,
+.project-directory-menu {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  color: #174f91;
+  background: transparent;
+}
+
+.project-directory-toolbar button:hover,
+.project-directory-menu:hover,
+.project-directory-menu:focus-visible {
+  color: #ffffff;
+  background: var(--selection);
+}
+
+.project-directory-header {
+  grid-template-columns: minmax(0, 1fr) 25px 25px;
+}
+
+.project-directory-header .group-header {
+  min-width: 0;
+}
+
+.project-directory-header .group-header span:nth-child(2) {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.project-directory-menu {
+  border-bottom: 1px solid #c5d5e2;
+  border-left: 1px solid #b7cbd9;
+  color: #4f6174;
+  background: linear-gradient(180deg, #f6fbff, #d8e8f4);
+}
+
+.project-directory-child .project-folder-row {
+  padding-left: 17px;
+}
+
+.project-directory-empty {
+  min-height: 31px;
+  padding: 8px 8px 7px 29px;
+  border-bottom: 1px solid #edf0f2;
+  color: #7b858e;
+  background: #ffffff;
+  font-size: 11px;
+}
+
 .group-header:hover {
   background: #fff3c8;
 }
@@ -1895,6 +1968,7 @@ svg {
 }
 
 .rename-terminal-dialog,
+.project-directory-dialog,
 .project-folder-dialog,
 .project-remove-dialog {
   width: min(340px, calc(100vw - 32px));
@@ -2193,10 +2267,11 @@ svg {
   }
 
   .project-group-header {
-    grid-template-columns: minmax(0, 1fr) 36px;
+    grid-template-columns: minmax(0, 1fr) 36px 36px;
   }
 
-  .project-group-header .group-add-project {
+  .project-group-header .group-add-project,
+  .project-group-header .project-directory-menu {
     width: 36px;
   }
 

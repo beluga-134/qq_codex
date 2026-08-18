@@ -787,7 +787,22 @@ fn parse_wsl_path(input: &str) -> Result<ResolvedProjectFolder, String> {
     })
 }
 
-fn parse_project_folder_path(input: &str) -> Result<ResolvedProjectFolder, String> {
+fn wsl_home_relative_path(input: &str) -> Option<Result<Vec<String>, String>> {
+    let trimmed = input.trim();
+    if matches!(trimmed, "~" | "/~") {
+        return Some(Ok(Vec::new()));
+    }
+    if let Some(relative) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+        .or_else(|| trimmed.strip_prefix("/~/"))
+    {
+        return Some(normalize_project_components(relative, false));
+    }
+    None
+}
+
+fn validated_project_folder_input(input: &str) -> Result<&str, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("项目路径不能为空".into());
@@ -797,6 +812,41 @@ fn parse_project_folder_path(input: &str) -> Result<ResolvedProjectFolder, Strin
     }
     if trimmed.chars().any(char::is_control) {
         return Err("项目路径包含不支持的控制字符".into());
+    }
+    Ok(trimmed)
+}
+
+fn parse_project_folder_path_with_wsl_home<F>(
+    input: &str,
+    resolve_wsl_home: F,
+) -> Result<ResolvedProjectFolder, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    let input = validated_project_folder_input(input)?;
+    if let Some(relative_components) = wsl_home_relative_path(input) {
+        let relative_components = relative_components?;
+        let home = resolve_wsl_home()?;
+        if !home.starts_with('/') {
+            return Err("WSL 返回的用户主目录不是绝对路径".into());
+        }
+        let home = parse_project_folder_path(&home)?;
+        let path = if relative_components.is_empty() {
+            home.wsl_path
+        } else if home.wsl_path == "/" {
+            format!("/{}", relative_components.join("/"))
+        } else {
+            format!("{}/{}", home.wsl_path, relative_components.join("/"))
+        };
+        return parse_project_folder_path(&path);
+    }
+    parse_project_folder_path(input)
+}
+
+fn parse_project_folder_path(input: &str) -> Result<ResolvedProjectFolder, String> {
+    let trimmed = validated_project_folder_input(input)?;
+    if trimmed.starts_with('~') {
+        return Err("WSL 用户主目录路径仅支持 ~ 或 ~/...".into());
     }
     if let Some(result) = parse_windows_drive_path(trimmed) {
         return result;
@@ -815,6 +865,7 @@ fn project_shell_target_from_cache(
         || wsl_path.chars().count() > 1024
         || wsl_path.chars().any(char::is_control)
         || !wsl_path.starts_with('/')
+        || legacy_wsl_home_cache_path(wsl_path)
     {
         return Err("项目的 WSL 路径缓存无效，请重新添加该项目".into());
     }
@@ -1003,6 +1054,26 @@ fn windows_path_to_wsl(path: &str) -> Result<String, String> {
 }
 
 #[cfg(target_os = "windows")]
+fn current_wsl_home_directory() -> Result<String, String> {
+    let mut command = wsl_command(None);
+    command.args(["--exec", "/bin/sh", "-lc", r#"printf '%s\n' "$HOME""#]);
+    wsl_command_text(command).map_err(|error| format!("无法解析 WSL 用户主目录：{error}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_wsl_home_directory() -> Result<String, String> {
+    std::env::var("HOME").map_err(|_| "无法解析当前用户主目录：未设置 HOME".into())
+}
+
+fn parse_project_folder_for_current_platform(input: &str) -> Result<ResolvedProjectFolder, String> {
+    parse_project_folder_path_with_wsl_home(input, current_wsl_home_directory)
+}
+
+fn legacy_wsl_home_cache_path(path: &str) -> bool {
+    path == "/~" || path.starts_with("/~/")
+}
+
+#[cfg(target_os = "windows")]
 fn wsl_path_to_windows(path: &str, distribution: Option<&str>) -> Result<String, String> {
     let mut command = wsl_command(distribution);
     command.args(["--cd", path, "--exec", "wslpath", "-w", "."]);
@@ -1010,7 +1081,7 @@ fn wsl_path_to_windows(path: &str, distribution: Option<&str>) -> Result<String,
 }
 
 fn resolve_project_folder_path(input: &str) -> Result<ResolvedProjectFolder, String> {
-    let mut resolved = parse_project_folder_path(input)?;
+    let mut resolved = parse_project_folder_for_current_platform(input)?;
 
     #[cfg(target_os = "windows")]
     {
@@ -1371,7 +1442,7 @@ fn execute_terminal(
 
 #[tauri::command]
 fn parse_project_folder(path: String) -> Result<ProjectFolderResolution, String> {
-    parse_project_folder_path(&path).map(project_folder_resolution)
+    parse_project_folder_for_current_platform(&path).map(project_folder_resolution)
 }
 
 #[tauri::command(async)]
@@ -1411,13 +1482,19 @@ fn pty_open(
         return Err("项目缺少 WSL 路径缓存，请重新添加该项目".into());
     }
     let (project_target, project_resolution) = if let Some(wsl_path) = project_wsl_path.as_deref() {
-        (
-            Some(project_shell_target_from_cache(
-                wsl_path,
-                project_wsl_distribution.as_deref(),
-            )?),
-            None,
-        )
+        if legacy_wsl_home_cache_path(wsl_path) {
+            let resolved = parse_project_folder_for_current_platform(wsl_path)?;
+            let target = project_shell_target(&resolved);
+            (Some(target), Some(project_folder_resolution(resolved)))
+        } else {
+            (
+                Some(project_shell_target_from_cache(
+                    wsl_path,
+                    project_wsl_distribution.as_deref(),
+                )?),
+                None,
+            )
+        }
     } else if let Some(project_path) = project_path.as_deref() {
         let resolved = resolve_project_folder_path(project_path)?;
         let target = project_shell_target(&resolved);
@@ -1812,6 +1889,47 @@ mod tests {
     }
 
     #[test]
+    fn wsl_home_paths_are_resolved_before_they_are_cached() {
+        let resolved =
+            parse_project_folder_path_with_wsl_home(r#"  ~/project/win_edge/./download  "#, || {
+                Ok("/home/beluga".into())
+            })
+            .unwrap();
+
+        assert_eq!(resolved.location.name, "download");
+        assert_eq!(
+            resolved.location.path,
+            "/home/beluga/project/win_edge/download"
+        );
+        assert_eq!(resolved.wsl_path, resolved.location.path);
+        assert_eq!(resolved.source, ProjectFolderSource::Wsl);
+
+        let home =
+            parse_project_folder_path_with_wsl_home("~", || Ok("/home/中文 用户".into())).unwrap();
+        assert_eq!(home.location.path, "/home/中文 用户");
+        assert_eq!(home.location.name, "中文 用户");
+
+        let legacy =
+            parse_project_folder_path_with_wsl_home("/~/project/win_edge/download", || {
+                Ok("/home/beluga".into())
+            })
+            .unwrap();
+        assert_eq!(legacy.wsl_path, "/home/beluga/project/win_edge/download");
+
+        assert!(parse_project_folder_path("~/project").is_err());
+        assert!(parse_project_folder_path_with_wsl_home("~/../etc", || {
+            panic!("an invalid relative path must not invoke WSL")
+        })
+        .is_err());
+        assert!(
+            parse_project_folder_path_with_wsl_home("~other/project", || {
+                panic!("unsupported home syntax must not invoke WSL")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn project_folder_paths_reject_ambiguous_or_unsafe_input() {
         for invalid in [
             "",
@@ -1937,6 +2055,7 @@ mod tests {
         assert_eq!(target.wsl_path, "/home/beluga/中文 项目");
         assert_eq!(target.wsl_distribution.as_deref(), Some("Ubuntu-24.04"));
         assert!(project_shell_target_from_cache("/", None).is_ok());
+        assert!(project_shell_target_from_cache("/~/project/win_edge/download", None).is_err());
 
         for invalid_path in [
             "home/beluga/project",
@@ -1986,6 +2105,20 @@ mod tests {
             assert!(help.contains("pwd"));
             assert!(help.contains("20 秒"));
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_project_folder_expands_the_default_wsl_home() {
+        let home = current_wsl_home_directory().unwrap();
+        let resolved =
+            parse_project_folder_for_current_platform("~/project/win_edge/download").unwrap();
+
+        assert_eq!(
+            resolved.wsl_path,
+            format!("{}/project/win_edge/download", home.trim_end_matches('/'))
+        );
+        assert!(!resolved.wsl_path.contains('~'));
     }
 
     #[cfg(target_os = "windows")]
