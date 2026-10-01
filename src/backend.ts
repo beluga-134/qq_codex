@@ -364,7 +364,7 @@ function resolvePreviewProjectFolder(input: string): ProjectFolderLocation {
 }
 
 function previewWslPath(projectPath?: string): string {
-  if (!projectPath) return "/mnt/e/qq_codex/qq_codex";
+  if (!projectPath) return "/home/developer/project";
   return resolvePreviewProjectPath(projectPath).location.wslPath;
 }
 

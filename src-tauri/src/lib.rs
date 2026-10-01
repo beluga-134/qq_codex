@@ -1854,34 +1854,35 @@ mod tests {
         assert_eq!(root.wsl_path, "/mnt/c");
 
         let unc = parse_project_folder_path(
-            r#"\\wsl.localhost\Ubuntu\home\beluga\project\CNV_polidy_identify"#,
+            r#"\\wsl.localhost\Ubuntu\home\developer\project\CNV_polidy_identify"#,
         )
         .unwrap();
         assert_eq!(unc.location.name, "CNV_polidy_identify");
         assert_eq!(
             unc.location.path,
-            r#"\\wsl.localhost\Ubuntu\home\beluga\project\CNV_polidy_identify"#
+            r#"\\wsl.localhost\Ubuntu\home\developer\project\CNV_polidy_identify"#
         );
-        assert_eq!(unc.wsl_path, "/home/beluga/project/CNV_polidy_identify");
+        assert_eq!(unc.wsl_path, "/home/developer/project/CNV_polidy_identify");
         assert_eq!(unc.wsl_distribution.as_deref(), Some("Ubuntu"));
         assert_eq!(unc.source, ProjectFolderSource::WslUnc);
 
-        let legacy_unc = parse_project_folder_path(r#"\\wsl$\Ubuntu\home\beluga\project"#).unwrap();
+        let legacy_unc =
+            parse_project_folder_path(r#"\\wsl$\Ubuntu\home\developer\project"#).unwrap();
         assert_eq!(
             legacy_unc.location.path,
-            r#"\\wsl$\Ubuntu\home\beluga\project"#
+            r#"\\wsl$\Ubuntu\home\developer\project"#
         );
-        assert_eq!(legacy_unc.wsl_path, "/home/beluga/project");
+        assert_eq!(legacy_unc.wsl_path, "/home/developer/project");
 
         for input in [
-            r#"home\beluga\project\CNV_polidy_identify"#,
-            "home/beluga/project/CNV_polidy_identify",
-            "/home/beluga/project/CNV_polidy_identify",
+            r#"home\developer\project\CNV_polidy_identify"#,
+            "home/developer/project/CNV_polidy_identify",
+            "/home/developer/project/CNV_polidy_identify",
         ] {
             let fallback = parse_project_folder_path(input).unwrap();
             assert_eq!(
                 fallback.location.path,
-                "/home/beluga/project/CNV_polidy_identify"
+                "/home/developer/project/CNV_polidy_identify"
             );
             assert_eq!(fallback.wsl_path, fallback.location.path);
             assert_eq!(fallback.source, ProjectFolderSource::Wsl);
@@ -1892,14 +1893,14 @@ mod tests {
     fn wsl_home_paths_are_resolved_before_they_are_cached() {
         let resolved =
             parse_project_folder_path_with_wsl_home(r#"  ~/project/win_edge/./download  "#, || {
-                Ok("/home/beluga".into())
+                Ok("/home/developer".into())
             })
             .unwrap();
 
         assert_eq!(resolved.location.name, "download");
         assert_eq!(
             resolved.location.path,
-            "/home/beluga/project/win_edge/download"
+            "/home/developer/project/win_edge/download"
         );
         assert_eq!(resolved.wsl_path, resolved.location.path);
         assert_eq!(resolved.source, ProjectFolderSource::Wsl);
@@ -1911,10 +1912,10 @@ mod tests {
 
         let legacy =
             parse_project_folder_path_with_wsl_home("/~/project/win_edge/download", || {
-                Ok("/home/beluga".into())
+                Ok("/home/developer".into())
             })
             .unwrap();
-        assert_eq!(legacy.wsl_path, "/home/beluga/project/win_edge/download");
+        assert_eq!(legacy.wsl_path, "/home/developer/project/win_edge/download");
 
         assert!(parse_project_folder_path("~/project").is_err());
         assert!(parse_project_folder_path_with_wsl_home("~/../etc", || {
@@ -1939,7 +1940,7 @@ mod tests {
             r#"D:\bad?name"#,
             r#"\\server"#,
             r#"\\server\share\..\workspace"#,
-            "/../../home/beluga",
+            "/../../home/developer",
             "D:\\bad\nname",
         ] {
             assert!(
@@ -2002,7 +2003,7 @@ mod tests {
     #[test]
     fn onecommander_receives_the_project_path_as_one_argument() {
         let executable = Path::new(r"C:\Program Files\OneCommander\OneCommander.exe");
-        let project_path = r"\\wsl.localhost\Ubuntu\home\beluga\中文 项目";
+        let project_path = r"\\wsl.localhost\Ubuntu\home\developer\中文 项目";
         let command = onecommander_command(executable, project_path);
         let arguments: Vec<_> = command.get_args().collect();
 
@@ -2021,27 +2022,27 @@ mod tests {
         assert_eq!(windows_path, r"D:\Workspace\中文 项目");
 
         let wsl_path = onecommander_project_path(
-            r"home\beluga\project\中文 项目",
+            r"home\developer\project\中文 项目",
             Some("Ubuntu"),
             |path, distribution| {
-                assert_eq!(path, "/home/beluga/project/中文 项目");
+                assert_eq!(path, "/home/developer/project/中文 项目");
                 assert_eq!(distribution, Some("Ubuntu"));
-                Ok(r"\\wsl.localhost\Ubuntu\home\beluga\project\中文 项目".to_string())
+                Ok(r"\\wsl.localhost\Ubuntu\home\developer\project\中文 项目".to_string())
             },
         )
         .unwrap();
         assert_eq!(
             wsl_path,
-            r"\\wsl.localhost\Ubuntu\home\beluga\project\中文 项目"
+            r"\\wsl.localhost\Ubuntu\home\developer\project\中文 项目"
         );
 
         assert!(
-            onecommander_project_path("/home/beluga", Some("Ubuntu?"), |_, _| {
+            onecommander_project_path("/home/developer", Some("Ubuntu?"), |_, _| {
                 panic!("an invalid distribution must not be passed to WSL")
             })
             .is_err()
         );
-        assert!(onecommander_project_path("/home/beluga", None, |_, _| {
+        assert!(onecommander_project_path("/home/developer", None, |_, _| {
             Ok("/still/a/wsl/path".to_string())
         })
         .is_err());
@@ -2050,15 +2051,15 @@ mod tests {
     #[test]
     fn project_shell_cache_only_accepts_canonical_launch_targets() {
         let target =
-            project_shell_target_from_cache("/home/beluga/中文 项目", Some("Ubuntu-24.04"))
+            project_shell_target_from_cache("/home/developer/中文 项目", Some("Ubuntu-24.04"))
                 .unwrap();
-        assert_eq!(target.wsl_path, "/home/beluga/中文 项目");
+        assert_eq!(target.wsl_path, "/home/developer/中文 项目");
         assert_eq!(target.wsl_distribution.as_deref(), Some("Ubuntu-24.04"));
         assert!(project_shell_target_from_cache("/", None).is_ok());
         assert!(project_shell_target_from_cache("/~/project/win_edge/download", None).is_err());
 
         for invalid_path in [
-            "home/beluga/project",
+            "home/developer/project",
             "/home/../etc",
             "/home/./project",
             "/home//project",
@@ -2082,7 +2083,7 @@ mod tests {
             "Ubuntu?",
         ] {
             assert!(
-                project_shell_target_from_cache("/home/beluga", Some(invalid_distribution))
+                project_shell_target_from_cache("/home/developer", Some(invalid_distribution))
                     .is_err(),
                 "unexpectedly accepted cached distribution: {invalid_distribution:?}"
             );
@@ -2142,13 +2143,13 @@ mod tests {
         assert_eq!(candidates[0].1.get_argv()[0].to_string_lossy(), "wsl.exe");
 
         let target =
-            project_shell_target_from_cache("/home/beluga/中文 项目", Some("Ubuntu")).unwrap();
+            project_shell_target_from_cache("/home/developer/中文 项目", Some("Ubuntu")).unwrap();
         configure_pty_command(&mut candidates[0].1, Some(&target));
         let arguments = candidates[0].1.get_argv();
         assert_eq!(arguments[1].to_string_lossy(), "--distribution");
         assert_eq!(arguments[2].to_string_lossy(), "Ubuntu");
         assert_eq!(arguments[3].to_string_lossy(), "--cd");
-        assert_eq!(arguments[4].to_string_lossy(), "/home/beluga/中文 项目");
+        assert_eq!(arguments[4].to_string_lossy(), "/home/developer/中文 项目");
     }
 
     #[test]

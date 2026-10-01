@@ -3,7 +3,7 @@
 本文记录本项目当前 Windows 开发环境的安装来源、落盘位置、系统级写入、验证和清理方式。当前项目根目录为：
 
 ```text
-E:\qq_codex\qq_codex
+C:\path\to\qq_codex
 ```
 
 后文以 `<项目根目录>` 表示该目录。若移动仓库，应重新运行配置脚本，不要继续使用旧目录中的绝对路径缓存。
@@ -142,7 +142,7 @@ WebView2 Runtime 和 WSL 在本项目配置前已经安装，本脚本只探测�
 必须在 Windows Terminal 或 `cmd.exe` 中运行，不要在 WSL shell 中执行 `.cmd` 安装入口：
 
 ```batch
-cd /d E:\qq_codex\qq_codex
+cd /d C:\path\to\qq_codex
 .\scripts\setup-windows.cmd -InstallBuildTools
 ```
 
@@ -160,7 +160,7 @@ cd /d E:\qq_codex\qq_codex
 启动 Windows 原生 GUI：
 
 ```batch
-cd /d E:\qq_codex\qq_codex
+cd /d C:\path\to\qq_codex
 .\start.cmd
 ```
 
@@ -172,7 +172,7 @@ command -v codex
 codex --version
 ```
 
-这些命令在默认 WSL 发行版中执行。当前预期分别能看到项目的 WSL 映射路径 `/mnt/e/qq_codex/qq_codex`、`/usr/bin/codex` 和 `codex-cli 0.144.6`。
+这些命令在默认 WSL 发行版中执行。输出应依次包含项目对应的 WSL 映射路径、Codex 可执行文件路径和当前 Codex 版本。
 
 只启动浏览器预览：
 

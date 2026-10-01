@@ -319,11 +319,13 @@ svg {
 }
 
 .workspace {
+  position: relative;
   display: grid;
   grid-template-columns: 248px 4px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  transition: grid-template-columns 160ms ease-out;
 }
 
 .workspace-splitter {
@@ -332,6 +334,56 @@ svg {
   border-left: 1px solid var(--control-light);
   border-right: 1px solid var(--control-dark);
   background: var(--control);
+}
+
+.roster-collapse-toggle {
+  position: absolute;
+  z-index: 8;
+  top: 50%;
+  left: 241px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--control-light);
+  border-right-color: var(--control-dark);
+  border-bottom-color: var(--control-dark);
+  border-radius: 2px;
+  color: #173f72;
+  background: var(--control);
+  box-shadow: 1px 1px 2px rgba(0, 22, 70, 0.25);
+  transform: translateY(-50%);
+  cursor: pointer;
+}
+
+.roster-collapse-toggle:hover {
+  border-color: #e5a700;
+  background: #fff3c8;
+}
+
+.roster-collapse-toggle:active {
+  padding-top: 1px;
+}
+
+@media (min-width: 720px) {
+  .workspace.roster-collapsed {
+    grid-template-columns: 24px 4px minmax(0, 1fr);
+  }
+
+  .workspace.roster-collapsed .roster-collapse-toggle {
+    left: 17px;
+  }
+
+  .workspace.roster-collapsed .roster-pane {
+    display: block;
+    cursor: pointer;
+    background: linear-gradient(180deg, #eef4f8 0%, #d8e8f4 100%);
+  }
+
+  .workspace.roster-collapsed .roster-pane > * {
+    display: none;
+  }
 }
 
 .roster-pane {
@@ -905,6 +957,103 @@ svg {
 
 .project-empty-roster {
   padding-top: 23px;
+}
+
+/* ── 项目文件夹 AI 状态联动 ──
+   running=黄色脉冲  approval=红色闪烁（最醒目，需要用户行动）  done=绿色短暂常亮 */
+.project-folder-row-wrap {
+  position: relative;
+}
+
+.project-folder-row-wrap::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  z-index: 1;
+  width: 3px;
+  background: transparent;
+}
+
+.project-folder-row-wrap[data-ai-state="running"]::before {
+  background: #e0ad26;
+  animation: ai-status-pulse 1.2s ease-in-out infinite;
+}
+
+.project-folder-row-wrap[data-ai-state="approval"]::before {
+  background: #d8493f;
+  animation: ai-status-blink 0.6s steps(2, end) infinite;
+}
+
+.project-folder-row-wrap[data-ai-state="done"]::before {
+  background: #28b04a;
+}
+
+.project-folder-icon {
+  position: relative;
+}
+
+.project-folder-icon::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  height: 8px;
+  border: 1px solid #ffffff;
+  border-radius: 50%;
+  background: transparent;
+  opacity: 0;
+  box-shadow: 0 0 0 1px rgba(79, 93, 100, 0.55);
+}
+
+.project-folder-row-wrap[data-ai-state="running"] .project-folder-icon::after,
+.project-folder-row-wrap[data-ai-state="approval"] .project-folder-icon::after,
+.project-folder-row-wrap[data-ai-state="done"] .project-folder-icon::after {
+  opacity: 1;
+}
+
+.project-folder-row-wrap[data-ai-state="running"] .project-folder-icon::after {
+  background: #e0ad26;
+}
+
+.project-folder-row-wrap[data-ai-state="approval"] .project-folder-icon::after {
+  background: #d8493f;
+}
+
+.project-folder-row-wrap[data-ai-state="done"] .project-folder-icon::after {
+  background: #28b04a;
+}
+
+.project-folder-row-wrap[data-ai-state="approval"]:not(:has(.project-folder-row.selected)) {
+  background: #fdefec;
+}
+
+.project-folder-row-wrap[data-ai-state="running"] .project-folder-copy span {
+  color: #8b6c12;
+  font-weight: 700;
+}
+
+.project-folder-row-wrap[data-ai-state="approval"] .project-folder-copy span {
+  color: #a32218;
+  font-weight: 700;
+}
+
+.project-folder-row-wrap[data-ai-state="done"] .project-folder-copy span {
+  color: #176b35;
+}
+
+@keyframes ai-status-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes ai-status-blink {
+  50% {
+    opacity: 0.1;
+  }
 }
 
 .contact-avatar {
@@ -2185,6 +2334,10 @@ svg {
     grid-template-columns: 218px 4px minmax(0, 1fr);
   }
 
+  .roster-collapse-toggle {
+    left: 211px;
+  }
+
   .contact-status,
   .actionbar-caption,
   .oicq-mark {
@@ -2214,7 +2367,8 @@ svg {
     position: relative;
   }
 
-  .workspace-splitter {
+  .workspace-splitter,
+  .roster-collapse-toggle {
     display: none;
   }
 

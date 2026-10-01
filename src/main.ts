@@ -3,6 +3,8 @@ import {
   Bell,
   Bold,
   ChevronDown,
+  ChevronsLeft,
+  ChevronsRight,
   Clock3,
   Columns2,
   createIcons,
@@ -99,6 +101,8 @@ const iconSet = {
   Bell,
   Bold,
   ChevronDown,
+  ChevronsLeft,
+  ChevronsRight,
   Clock3,
   Columns2,
   Eraser,
@@ -183,6 +187,12 @@ interface TerminalPaneRuntime {
   mounted: boolean;
   disposed: boolean;
   disposables: IDisposable[];
+  aiDecoder: TextDecoder;
+  aiTail: string;
+  aiState: TerminalPaneAiState;
+  aiLastOutputAt: number;
+  aiQuietTimer: number | null;
+  aiDoneTimer: number | null;
 }
 
 interface TerminalWorkspace {
@@ -214,17 +224,20 @@ let pendingProjectRemovalId: string | null = null;
 let toastTimer: number | null = null;
 let contactSelectionSequence = 0;
 const ZOOM_STORAGE_KEY = "ociq.ui.zoom";
+const ROSTER_COLLAPSED_STORAGE_KEY = "ociq.ui.roster-collapsed";
 const AVATAR_STORAGE_KEY = "ociq.profile.avatar";
 const PROJECT_FOLDERS_STORAGE_KEY = "ociq.project-folders.v1";
 const PROJECT_DIRECTORIES_STORAGE_KEY = "ociq.project-directories.v1";
 const DEFAULT_PROJECT_DIRECTORY_ID = "default-project-directory";
 const ZOOM_LEVELS = [0.75, 0.9, 1, 1.1, 1.25, 1.5];
 let currentZoom = readStoredZoom();
+let rosterCollapsed = readStoredRosterCollapsed();
 let customAvatar = readStoredAvatar();
 let pendingAvatar: string | null = customAvatar;
 let projectDirectories = readStoredProjectDirectories();
 let projectFolders = readStoredProjectFolders();
 const terminalWorkspaces = new Map<string, TerminalWorkspace>();
+const projectAiStates = new Map<string, TerminalPaneAiState>();
 const MAX_TERMINAL_PANES = 4;
 const collapsedGroups = new Set<string>();
 const pendingReplies = new Set<string>();
@@ -434,7 +447,7 @@ appRoot.innerHTML = `
     </nav>
 
     <div class="workspace">
-      <aside class="roster-pane" aria-label="好友列表">
+      <aside class="roster-pane" id="roster-pane" aria-label="好友列表">
         <section class="self-profile">
           <button class="self-avatar-button" id="self-avatar-button" type="button" title="更换头像" aria-label="更换头像">
             <span class="avatar-frame avatar-large">
@@ -482,6 +495,7 @@ appRoot.innerHTML = `
       </aside>
 
       <div class="workspace-splitter" aria-hidden="true"></div>
+      <button class="roster-collapse-toggle" id="roster-collapse-toggle" type="button" aria-expanded="true" aria-controls="roster-pane" title="收起好友列表 (Ctrl+B)" aria-label="收起好友列表">${icon("ChevronsLeft", 13)}</button>
 
       <section class="chat-pane" aria-label="聊天窗口">
         <header class="chat-contact-header">
@@ -1269,7 +1283,11 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
           !pane.disposed &&
           pane.generation === generation &&
           pane.workspace.panes.get(pane.id) === pane
-        ) pane.terminal.write(ptyBytes(data));
+        ) {
+          const bytes = ptyBytes(data);
+          pane.terminal.write(bytes);
+          feedPaneAiActivity(pane, bytes);
+        }
       },
       (exit) => {
         if (returnedSessionId === null) earlyExit = exit;
@@ -1363,6 +1381,145 @@ function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): vo
   }
 }
 
+type TerminalPaneAiState = "idle" | "running" | "approval" | "done";
+
+// ── 项目文件夹 ↔ 终端 AI 状态联动（方案 A：输出启发式）──
+// 扫描 PTY 输出中的 TUI 提示文字推断 AI 状态，映射到左侧项目文件夹行：
+//   running  = AI 正在工作（codex / Claude Code / pi 运行时都显示 "esc to interrupt"）
+//   approval = 等待审批（codex / Claude Code 的审批选项文案；
+//               pi 的自定义 permission 扩展审批对话框：“批准执行？/总是允许这条命令/审批原因:”）
+//   done     = 完成（codex 显式 "tokens used"；其余靠“运行标记消失 + 输出静默”启发式）
+// 匹配失败时静默降级为不显示，不影响终端。要支持新的 CLI，往对应数组加正则即可。
+const AI_ACTIVITY_PATTERNS: Record<Exclude<TerminalPaneAiState, "idle">, RegExp[]> = {
+  running: [
+    /\bto interrupt\b/gi,
+    // pi 默认 working 行：盲文 spinner 帧 + “Working”（帧集来自 pi-tui DEFAULT_FRAMES；
+    // 不裸用 “Working”/裸 spinner，避免 npm 等同款 spinner 和模型正文 “working” 误报）
+    /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working\b/gu,
+  ],
+  approval: [
+    /\band (?:auto-)?approve\b/gi,
+    /\bdon.t ask again\b/gi,
+    /\bwhat to do differently\b/gi,
+    /\bdo you want to (?:proceed|run|create|edit|make|update)\b/gi,
+    /\besc to approve\b/gi,
+    /批准执行/gu,
+    /总是允许这条命令/gu,
+    /审批原因[:：]/gu,
+  ],
+  done: [
+    /\btokens used\b/gi,
+    /\bturn ended\b/gi,
+  ],
+};
+const AI_ACTIVITY_TAIL_LIMIT = 3072;
+const AI_ACTIVITY_QUIET_MS = 2600;
+const AI_ACTIVITY_DONE_LINGER_MS = 6000;
+const AI_ACTIVITY_STATE_TEXT: Record<TerminalPaneAiState, string> = {
+  idle: "",
+  running: "AI 正在工作…",
+  approval: "等待审批…",
+  done: "已完成",
+};
+
+function stripTerminalEscapes(text: string): string {
+  return text
+    .replace(/\u001bP[\s\S]{0,2048}?(?:\u001b\\|$)/g, "")
+    .replace(/\u001b\][^\u0007\u001b]{0,2048}(?:\u0007|\u001b\\|$)?/g, "")
+    .replace(/\u001b\[[0-9;?<=>!"' ]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b[@-Z\\-_]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+}
+
+function paneAiMarkerState(pane: TerminalPaneRuntime): TerminalPaneAiState | null {
+  let best: TerminalPaneAiState | null = null;
+  let bestIndex = -1;
+  (Object.keys(AI_ACTIVITY_PATTERNS) as Array<keyof typeof AI_ACTIVITY_PATTERNS>).forEach((state) => {
+    for (const pattern of AI_ACTIVITY_PATTERNS[state]) {
+      for (const match of pane.aiTail.matchAll(pattern)) {
+        const index = match.index ?? -1;
+        if (index > bestIndex) {
+          bestIndex = index;
+          best = state;
+        }
+      }
+    }
+  });
+  return best;
+}
+
+function publishWorkspaceAiState(workspace: TerminalWorkspace): void {
+  const folder = workspace.projectFolder;
+  if (!folder) return;
+  const states = [...workspace.panes.values()].map((pane) => pane.aiState);
+  const aggregate: TerminalPaneAiState = states.includes("approval")
+    ? "approval"
+    : states.includes("running")
+      ? "running"
+      : states.includes("done")
+        ? "done"
+        : "idle";
+  const previous = projectAiStates.get(folder.id) ?? "idle";
+  projectAiStates.set(folder.id, aggregate);
+  if (previous !== aggregate) applyProjectAiStateToDom(folder.id, aggregate);
+}
+
+function applyProjectAiStateToDom(projectId: string, state: TerminalPaneAiState): void {
+  const wrap = contactList.querySelector<HTMLElement>(
+    `.project-folder-row-wrap[data-project-id="${CSS.escape(projectId)}"]`,
+  );
+  if (!wrap) return;
+  if (state === "idle") delete wrap.dataset.aiState;
+  else wrap.dataset.aiState = state;
+  const status = wrap.querySelector<HTMLElement>(".project-folder-copy span");
+  if (status) {
+    status.textContent = state === "idle"
+      ? projectFolders.find((folder) => folder.id === projectId)?.path ?? status.textContent
+      : AI_ACTIVITY_STATE_TEXT[state];
+  }
+}
+
+function setPaneAiState(pane: TerminalPaneRuntime, state: TerminalPaneAiState): void {
+  if (pane.disposed || pane.aiState === state) return;
+  pane.aiState = state;
+  if (pane.aiDoneTimer !== null) {
+    window.clearTimeout(pane.aiDoneTimer);
+    pane.aiDoneTimer = null;
+  }
+  if (state === "done") {
+    pane.aiDoneTimer = window.setTimeout(() => {
+      pane.aiDoneTimer = null;
+      if (!pane.disposed && pane.aiState === "done") setPaneAiState(pane, "idle");
+    }, AI_ACTIVITY_DONE_LINGER_MS);
+  }
+  publishWorkspaceAiState(pane.workspace);
+}
+
+function schedulePaneAiQuietCheck(pane: TerminalPaneRuntime): void {
+  if (pane.aiQuietTimer !== null) window.clearTimeout(pane.aiQuietTimer);
+  pane.aiQuietTimer = window.setTimeout(() => {
+    pane.aiQuietTimer = null;
+    if (pane.disposed || pane.aiState !== "running") return;
+    const quiet = Date.now() - pane.aiLastOutputAt >= AI_ACTIVITY_QUIET_MS;
+    const stillRunning = AI_ACTIVITY_PATTERNS.running.some(
+      (pattern) => pane.aiTail.search(pattern) !== -1,
+    );
+    if (quiet && !stillRunning) setPaneAiState(pane, "done");
+    else schedulePaneAiQuietCheck(pane);
+  }, AI_ACTIVITY_QUIET_MS + 250);
+}
+
+function feedPaneAiActivity(pane: TerminalPaneRuntime, data: Uint8Array): void {
+  if (pane.disposed || !pane.workspace.projectFolder) return;
+  const text = pane.aiDecoder.decode(data, { stream: true });
+  if (!text) return;
+  pane.aiTail = `${pane.aiTail}${stripTerminalEscapes(text)}`.slice(-AI_ACTIVITY_TAIL_LIMIT);
+  pane.aiLastOutputAt = Date.now();
+  const marker = paneAiMarkerState(pane);
+  if (marker) setPaneAiState(pane, marker);
+  schedulePaneAiQuietCheck(pane);
+}
+
 function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
   const id = workspace.nextPaneId++;
   const element = document.createElement("section");
@@ -1454,6 +1611,12 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
     mounted: false,
     disposed: false,
     disposables: [],
+    aiDecoder: new TextDecoder(),
+    aiTail: "",
+    aiState: "idle",
+    aiLastOutputAt: 0,
+    aiQuietTimer: null,
+    aiDoneTimer: null,
   };
   terminal.attachCustomKeyEventHandler((event) => handleTerminalClipboardShortcut(pane, event));
   element.addEventListener(
@@ -1577,9 +1740,18 @@ async function disposeTerminalPane(
     window.clearTimeout(pane.resizeTimer);
     pane.resizeTimer = null;
   }
+  if (pane.aiQuietTimer !== null) {
+    window.clearTimeout(pane.aiQuietTimer);
+    pane.aiQuietTimer = null;
+  }
+  if (pane.aiDoneTimer !== null) {
+    window.clearTimeout(pane.aiDoneTimer);
+    pane.aiDoneTimer = null;
+  }
   pane.resizeObserver?.disconnect();
   pane.resizeObserver = null;
   pane.disposables.splice(0).forEach((disposable) => disposable.dispose());
+  publishWorkspaceAiState(pane.workspace);
   const sessionId = pane.sessionId;
   pane.sessionId = null;
   pane.terminal.dispose();
@@ -1740,6 +1912,37 @@ function changePageZoom(step: -1 | 1): void {
   const index = ZOOM_LEVELS.indexOf(currentZoom);
   const nextIndex = Math.max(0, Math.min(ZOOM_LEVELS.length - 1, index + step));
   if (nextIndex !== index) void applyPageZoom(ZOOM_LEVELS[nextIndex]);
+}
+
+function readStoredRosterCollapsed(): boolean {
+  try {
+    return localStorage.getItem(ROSTER_COLLAPSED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function applyRosterCollapsed(collapsed: boolean, announce = false): void {
+  rosterCollapsed = collapsed;
+  query<HTMLElement>(".workspace").classList.toggle("roster-collapsed", collapsed);
+  const toggle = query<HTMLButtonElement>("#roster-collapse-toggle");
+  const label = collapsed ? "展开好友列表" : "收起好友列表";
+  toggle.innerHTML = icon(collapsed ? "ChevronsRight" : "ChevronsLeft", 13);
+  toggle.title = `${label} (Ctrl+B)`;
+  toggle.setAttribute("aria-label", label);
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  refreshIcons();
+  try {
+    localStorage.setItem(ROSTER_COLLAPSED_STORAGE_KEY, collapsed ? "1" : "0");
+  } catch {
+    if (announce) showToast("无法保存好友列表折叠状态");
+  }
+  requestAnimationFrame(() => scheduleTerminalFit());
+  if (announce) showToast(collapsed ? "好友列表已收起" : "好友列表已展开");
+}
+
+function toggleRosterCollapsed(): void {
+  applyRosterCollapsed(!rosterCollapsed, true);
 }
 
 function updateAvatarUi(): void {
@@ -1912,6 +2115,8 @@ function projectFolderRow(folder: ProjectFolder): HTMLElement {
   const wrapper = document.createElement("div");
   wrapper.className = "project-folder-row-wrap project-directory-child";
   wrapper.dataset.projectId = folder.id;
+  const aiState = projectAiStates.get(folder.id) ?? "idle";
+  if (aiState !== "idle") wrapper.dataset.aiState = aiState;
 
   const button = document.createElement("button");
   button.type = "button";
@@ -1930,7 +2135,7 @@ function projectFolderRow(folder: ProjectFolder): HTMLElement {
   const name = document.createElement("strong");
   name.textContent = folder.name;
   const path = document.createElement("span");
-  path.textContent = folder.path;
+  path.textContent = aiState === "idle" ? folder.path : AI_ACTIVITY_STATE_TEXT[aiState];
   copy.append(name, path);
   button.append(folderIcon, copy);
   button.addEventListener("click", (event) => {
@@ -3036,6 +3241,10 @@ function bindEvents(): void {
   query("#minimize-window").addEventListener("click", () => void windowAction("minimize"));
   query("#maximize-window").addEventListener("click", () => void windowAction("maximize"));
   query("#close-window").addEventListener("click", () => void windowAction("close"));
+  query("#roster-collapse-toggle").addEventListener("click", toggleRosterCollapsed);
+  query("#roster-pane").addEventListener("click", () => {
+    if (rosterCollapsed) applyRosterCollapsed(false);
+  });
 
   query<HTMLInputElement>("#contact-search").addEventListener("input", (event) => {
     filterText = (event.currentTarget as HTMLInputElement).value;
@@ -3255,6 +3464,11 @@ function bindEvents(): void {
   });
   document.addEventListener("keydown", (event) => {
     if (event.ctrlKey && !event.altKey) {
+      if (event.key === "b" || event.key === "B") {
+        event.preventDefault();
+        toggleRosterCollapsed();
+        return;
+      }
       if (event.key === "0") {
         event.preventDefault();
         void applyPageZoom(1);
@@ -3288,6 +3502,7 @@ async function start(): Promise<void> {
   refreshIcons();
   bindEvents();
   await applyPageZoom(currentZoom, false);
+  applyRosterCollapsed(rosterCollapsed);
   void syncWindowState();
   if (isTauriRuntime()) {
     const appWindow = getCurrentWindow();

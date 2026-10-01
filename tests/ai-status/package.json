@@ -1,0 +1,9 @@
+{
+  "name": "ai-status-tests",
+  "private": true,
+  "type": "module",
+  "description": "项目文件夹 AI 状态联动的逻辑与视觉测试（依赖项目根 node_modules 的 typescript/lucide）",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
