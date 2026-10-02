@@ -6,6 +6,7 @@ import {
   type Contact,
   type Message,
   type Presence,
+  type ProjectDirectory,
   type ProjectFolder,
   type ProjectFolderLocation,
   type TerminalExecution,
@@ -24,6 +25,11 @@ export interface PtyOpenResult {
 }
 
 export type PtyData = ArrayBuffer | Uint8Array | number[];
+
+export interface ProjectStore {
+  directories: ProjectDirectory[];
+  folders: ProjectFolder[];
+}
 
 const now = Date.now();
 
@@ -565,6 +571,25 @@ export const backend = {
   async parseProjectFolder(path: string): Promise<ProjectFolderLocation> {
     if (isTauri()) return invoke<ProjectFolderLocation>("parse_project_folder", { path });
     return resolvePreviewProjectFolder(path);
+  },
+
+  async projectStorePath(): Promise<string> {
+    if (isTauri()) return invoke<string>("project_store_path");
+    throw new Error("浏览器预览没有外部项目数据文件");
+  },
+
+  async readProjectStore(): Promise<ProjectStore | null> {
+    if (isTauri()) return invoke<ProjectStore | null>("read_project_store");
+    return null;
+  },
+
+  async writeProjectStore(store: ProjectStore): Promise<void> {
+    if (isTauri()) await invoke<void>("write_project_store", { store });
+  },
+
+  async openProjectStoreFile(): Promise<void> {
+    if (isTauri()) await invoke<void>("open_project_store_file");
+    else throw new Error("浏览器预览不支持打开项目数据文件");
   },
 
   async openProjectFolderInOneCommander(folder: ProjectFolder): Promise<void> {

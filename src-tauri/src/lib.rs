@@ -11,7 +11,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::ipc::{Channel, Response};
-use tauri::State;
+use tauri::{Emitter, State};
 
 const SELF_ID: &str = "me";
 const TERMINAL_ID: &str = "terminal";
@@ -86,6 +86,39 @@ pub struct ProjectFolderResolution {
 pub struct PtyOpenResult {
     pub session_id: u64,
     pub project: Option<ProjectFolderResolution>,
+}
+
+/// External, user-editable JSON file (`project-folders.json` next to the exe)
+/// that stores project directories (roster groups) and their project folders.
+/// The file is portable: copying it alongside the exe carries the roster to
+/// another machine without any per-computer state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDirectoryRecord {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFolderRecord {
+    pub id: String,
+    pub directory_id: String,
+    pub name: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_distribution: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStoreFile {
+    #[serde(default)]
+    pub directories: Vec<ProjectDirectoryRecord>,
+    #[serde(default)]
+    pub folders: Vec<ProjectFolderRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1445,6 +1478,98 @@ fn parse_project_folder(path: String) -> Result<ProjectFolderResolution, String>
     parse_project_folder_for_current_platform(&path).map(project_folder_resolution)
 }
 
+const PROJECT_STORE_FILE_NAME: &str = "project-folders.json";
+const PROJECT_STORE_POLL_INTERVAL_MS: u64 = 1_500;
+const PROJECT_STORE_CHANGED_EVENT: &str = "project-store-changed";
+
+fn project_store_file_path() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("无法定位可执行文件：{error}"))?;
+    let directory = exe
+        .parent()
+        .ok_or_else(|| "无法定位可执行文件所在目录".to_string())?;
+    Ok(directory.join(PROJECT_STORE_FILE_NAME))
+}
+
+fn project_store_signature(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
+}
+
+#[tauri::command]
+fn project_store_path() -> Result<String, String> {
+    project_store_file_path().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn read_project_store() -> Result<Option<ProjectStoreFile>, String> {
+    let path = project_store_file_path()?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|error| format!("无法读取项目数据文件：{error}"))?;
+    let store = serde_json::from_str::<ProjectStoreFile>(&content)
+        .map_err(|error| format!("项目数据文件格式无效：{error}"))?;
+    Ok(Some(store))
+}
+
+#[tauri::command]
+fn write_project_store(store: ProjectStoreFile) -> Result<(), String> {
+    let path = project_store_file_path()?;
+    let mut json = serde_json::to_string_pretty(&store)
+        .map_err(|error| format!("无法序列化项目数据：{error}"))?;
+    json.push('\n');
+    let temp_path = path.with_extension("json.tmp");
+    std::fs::write(&temp_path, json).map_err(|error| format!("无法写入项目数据文件：{error}"))?;
+    std::fs::rename(&temp_path, &path).map_err(|error| format!("无法更新项目数据文件：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command(async)]
+fn open_project_store_file() -> Result<(), String> {
+    let path = project_store_file_path()?;
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("无法打开项目数据文件：{error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("无法打开项目数据文件：{error}"))?;
+        Ok(())
+    }
+}
+
+fn spawn_project_store_watcher(app: tauri::AppHandle) {
+    thread::spawn(move || {
+        let mut last_signature: Option<Option<(u64, Option<SystemTime>)>> = None;
+        loop {
+            thread::sleep(Duration::from_millis(PROJECT_STORE_POLL_INTERVAL_MS));
+            let signature = project_store_file_path()
+                .ok()
+                .and_then(|path| project_store_signature(&path));
+            let changed = last_signature.is_some_and(|previous| previous != signature);
+            last_signature = Some(signature);
+            if changed {
+                if let Err(error) = app.emit(PROJECT_STORE_CHANGED_EVENT, ()) {
+                    eprintln!("无法广播项目数据文件变更：{error}");
+                }
+            }
+        }
+    });
+}
+
 #[tauri::command(async)]
 fn open_project_folder_in_onecommander(
     path: String,
@@ -1707,7 +1832,9 @@ pub fn run() {
     configure_wslg_input_backend();
 
     tauri::Builder::default()
-        .setup(|_app| {
+        .setup(|app| {
+            spawn_project_store_watcher(app.handle().clone());
+
             #[cfg(target_os = "linux")]
             {
                 use tauri::Manager;
@@ -1716,7 +1843,7 @@ pub fn run() {
                 // Wry 0.55 disables WebKitGTK preedit by default. Re-enable it
                 // so Fcitx/IBus can deliver proper DOM composition events and
                 // render an in-place candidate string in input/textarea fields.
-                if let Some(main_webview) = _app.get_webview_window("main") {
+                if let Some(main_webview) = app.get_webview_window("main") {
                     main_webview.with_webview(|platform_webview| {
                         if let Some(input_context) = platform_webview.inner().input_method_context()
                         {
@@ -1740,6 +1867,10 @@ pub fn run() {
             execute_terminal,
             parse_project_folder,
             open_project_folder_in_onecommander,
+            project_store_path,
+            read_project_store,
+            write_project_store,
+            open_project_store_file,
             pty_open,
             pty_write,
             pty_resize,
@@ -2174,5 +2305,46 @@ mod tests {
         assert_eq!(snapshot.current_user.presence, "away");
         assert_eq!(snapshot.contacts.len(), 6);
         assert_eq!(snapshot.active_contact_id, "linxia");
+    }
+
+    #[test]
+    fn project_store_roundtrips_through_json() {
+        let store = ProjectStoreFile {
+            directories: vec![ProjectDirectoryRecord {
+                id: "dir-1".into(),
+                name: "项目文件夹".into(),
+            }],
+            folders: vec![ProjectFolderRecord {
+                id: "p-1".into(),
+                directory_id: "dir-1".into(),
+                name: "demo".into(),
+                path: "\\\\wsl.localhost\\Ubuntu\\home\\beluga\\demo".into(),
+                wsl_path: Some("/home/beluga/demo".into()),
+                wsl_distribution: Some("Ubuntu".into()),
+            }],
+        };
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(json.contains("\"directoryId\""));
+        assert!(json.contains("\"wslPath\""));
+        assert!(json.contains("\"wslDistribution\""));
+        let parsed: ProjectStoreFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, store);
+    }
+
+    #[test]
+    fn project_store_tolerates_missing_optional_fields() {
+        let parsed: ProjectStoreFile = serde_json::from_str(
+            r#"{"directories":[{"id":"d","name":"目录"}],"folders":[{"id":"f","directoryId":"d","name":"p","path":"C:\\work"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.folders.len(), 1);
+        assert_eq!(parsed.folders[0].wsl_path, None);
+        assert_eq!(parsed.folders[0].wsl_distribution, None);
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("wslPath"));
+        assert!(!serialized.contains("wslDistribution"));
+        let empty: ProjectStoreFile = serde_json::from_str("{}").unwrap();
+        assert!(empty.directories.is_empty());
+        assert!(empty.folders.is_empty());
     }
 }

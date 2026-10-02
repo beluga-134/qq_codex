@@ -51,10 +51,22 @@ REM 构建前端并执行 Rust 测试、检查
 
 在项目终端里运行 codex、Claude Code 或 pi 等 AI CLI 时，左侧对应的项目文件夹会显示实时状态：黄色脉冲表示 AI 正在工作，红色闪烁表示等待审批，绿色短暂常亮表示已完成。检测基于终端输出启发式，匹配失败时静默降级，不影响终端本身。
 
+## 便携项目数据（project-folders.json）
+
+左侧群组里的项目目录和项目文件夹不再绑定本机 WebView 存储，而是保存在 exe 同目录的 `project-folders.json`：
+
+- 首次运行时自动把原有 localStorage 数据迁移进该文件，之后数据只随 exe 目录走，拷贝 exe + json 即可在另一台电脑上保留全部群组和项目。
+- 文件可随时用任意编辑器修改；应用每 1.5 秒检测变更，保存后界面自动刷新生效，外部删除的项目会同时关闭对应终端会话。
+- 在应用内新建、重命名、删除项目也会实时写回该文件（原子替换写入）。
+- 项目目录工具栏的笔形按钮会用系统默认程序打开该文件，便于快速外部编辑。
+- 文件损坏或目录只读时应用自动降级回本机存储并提示，修复后重新检测到文件即可恢复便携模式。
+- 浏览器预览（非桌面版）仍使用内存/localStorage，不涉及该文件。
+
 ## 目录
 
 - `src/`：TypeScript 界面、复古主题与浏览器预览后端
 - `src-tauri/`：Rust 聊天状态、Tauri commands、WSL PTY 与 Windows 桌面配置
+- `project-folders.json`：可外部编辑的便携项目数据，与 exe 同目录，详见下节
 - `.tooling/`：项目内的 Windows Node、MinGit、Rust、Cargo 和构建工具
 - `.cache/`：npm、Cargo、Rustup 等下载与运行缓存
 - `.cargo/`、`.npmrc`：项目级国内镜像配置

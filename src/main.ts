@@ -8,6 +8,7 @@ import {
   Clock3,
   Columns2,
   createIcons,
+  FilePen,
   Eraser,
   FileUp,
   Folder,
@@ -44,6 +45,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Terminal as XtermTerminal, type IDisposable } from "@xterm/xterm";
@@ -51,7 +53,7 @@ import { FitAddon } from "@xterm/addon-fit";
 
 import "./styles.css";
 import "@xterm/xterm/css/xterm.css";
-import { backend, type PtyExit } from "./backend";
+import { backend, type ProjectStore, type PtyExit } from "./backend";
 import {
   PROJECT_CONTACT_PREFIX,
   TERMINAL_CONTACT_ID,
@@ -106,6 +108,7 @@ const iconSet = {
   Clock3,
   Columns2,
   Eraser,
+  FilePen,
   FileUp,
   Folder,
   FolderOpen,
@@ -344,76 +347,231 @@ function normalizeProjectDirectoryName(input: string): string {
 function readStoredProjectDirectories(): ProjectDirectory[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(PROJECT_DIRECTORIES_STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(parsed)) return [defaultProjectDirectory()];
-    const ids = new Set<string>();
-    const directories = parsed.filter((value): value is ProjectDirectory => {
-      if (!value || typeof value !== "object") return false;
-      const candidate = value as Partial<ProjectDirectory>;
-      if (typeof candidate.id !== "string" || typeof candidate.name !== "string" || !candidate.id) {
-        return false;
-      }
-      try {
-        candidate.name = normalizeProjectDirectoryName(candidate.name);
-      } catch {
-        return false;
-      }
-      if (ids.has(candidate.id)) return false;
-      ids.add(candidate.id);
-      return true;
-    }).slice(0, 50);
-    return directories.length > 0 ? directories : [defaultProjectDirectory()];
+    return parseProjectDirectoriesValue(parsed);
   } catch {
     return [defaultProjectDirectory()];
   }
 }
 
+function parseProjectDirectoriesValue(value: unknown): ProjectDirectory[] {
+  if (!Array.isArray(value)) return [defaultProjectDirectory()];
+  const ids = new Set<string>();
+  const directories = value.filter((item): item is ProjectDirectory => {
+    if (!item || typeof item !== "object") return false;
+    const candidate = item as Partial<ProjectDirectory>;
+    if (typeof candidate.id !== "string" || typeof candidate.name !== "string" || !candidate.id) {
+      return false;
+    }
+    try {
+      candidate.name = normalizeProjectDirectoryName(candidate.name);
+    } catch {
+      return false;
+    }
+    if (ids.has(candidate.id)) return false;
+    ids.add(candidate.id);
+    return true;
+  }).slice(0, 50);
+  return directories.length > 0 ? directories : [defaultProjectDirectory()];
+}
+
 function saveProjectDirectories(next: ProjectDirectory[]): void {
-  localStorage.setItem(PROJECT_DIRECTORIES_STORAGE_KEY, JSON.stringify(next));
   projectDirectories = next;
+  scheduleProjectStorePersist();
 }
 
 function readStoredProjectFolders(): ProjectFolder[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(PROJECT_FOLDERS_STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(parsed)) return [];
-    const ids = new Set<string>();
-    const paths = new Set<string>();
-    return parsed.filter((value): value is ProjectFolder => {
-      if (!value || typeof value !== "object") return false;
-      const candidate = value as Partial<ProjectFolder>;
-      if (
-        typeof candidate.id !== "string" ||
-        typeof candidate.name !== "string" ||
-        typeof candidate.path !== "string" ||
-        !candidate.id ||
-        !candidate.name.trim() ||
-        /[\u0000-\u001f\u007f]/.test(candidate.name)
-      ) return false;
-      candidate.name = candidate.name.trim();
-      candidate.path = candidate.path.trim();
-      candidate.directoryId = typeof candidate.directoryId === "string"
-        && projectDirectories.some((directory) => directory.id === candidate.directoryId)
-        ? candidate.directoryId
-        : projectDirectories[0]!.id;
-      if (!isStoredProjectPath(candidate.path)) return false;
-      if (!hasProjectLaunchCache(candidate as ProjectFolder)) {
-        delete candidate.wslPath;
-        delete candidate.wslDistribution;
-      }
-      const normalizedPath = projectPathKey(candidate.path);
-      if (ids.has(candidate.id) || paths.has(normalizedPath)) return false;
-      ids.add(candidate.id);
-      paths.add(normalizedPath);
-      return true;
-    }).slice(0, 100);
+    return parseProjectFoldersValue(parsed, projectDirectories);
   } catch {
     return [];
   }
 }
 
+function parseProjectFoldersValue(value: unknown, directories: ProjectDirectory[]): ProjectFolder[] {
+  if (!Array.isArray(value)) return [];
+  const ids = new Set<string>();
+  const paths = new Set<string>();
+  return value.filter((item): item is ProjectFolder => {
+    if (!item || typeof item !== "object") return false;
+    const candidate = item as Partial<ProjectFolder>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.name !== "string" ||
+      typeof candidate.path !== "string" ||
+      !candidate.id ||
+      !candidate.name.trim() ||
+      /[\u0000-\u001f\u007f]/.test(candidate.name)
+    ) return false;
+    candidate.name = candidate.name.trim();
+    candidate.path = candidate.path.trim();
+    candidate.directoryId = typeof candidate.directoryId === "string"
+      && directories.some((directory) => directory.id === candidate.directoryId)
+      ? candidate.directoryId
+      : directories[0]!.id;
+    if (!isStoredProjectPath(candidate.path)) return false;
+    if (typeof candidate.wslPath === "string" && candidate.wslDistribution === undefined) {
+      candidate.wslDistribution = null;
+    }
+    if (!hasProjectLaunchCache(candidate as ProjectFolder)) {
+      delete candidate.wslPath;
+      delete candidate.wslDistribution;
+    }
+    const normalizedPath = projectPathKey(candidate.path);
+    if (ids.has(candidate.id) || paths.has(normalizedPath)) return false;
+    ids.add(candidate.id);
+    paths.add(normalizedPath);
+    return true;
+  }).slice(0, 100);
+}
+
 function saveProjectFolders(next: ProjectFolder[]): void {
-  localStorage.setItem(PROJECT_FOLDERS_STORAGE_KEY, JSON.stringify(next));
   projectFolders = next;
+  scheduleProjectStorePersist();
+}
+
+const PROJECT_STORE_CHANGED_EVENT = "project-store-changed";
+let projectStorePathLabel = "";
+let projectStorePersistTimer: number | null = null;
+let projectStoreFlushInFlight = false;
+let projectStoreSyncing = false;
+let projectStoreReadFailed = false;
+
+function serializeProjectStoreData(
+  directories: ProjectDirectory[],
+  folders: ProjectFolder[],
+): string {
+  return JSON.stringify({
+    directories: directories.map((directory) => ({ id: directory.id, name: directory.name })),
+    folders: folders.map((folder) => ({
+      id: folder.id,
+      directoryId: folder.directoryId,
+      name: folder.name,
+      path: folder.path,
+      ...(hasProjectLaunchCache(folder)
+        ? { wslPath: folder.wslPath, wslDistribution: folder.wslDistribution }
+        : {}),
+    })),
+  });
+}
+
+function persistProjectStoreToLocalStorage(): void {
+  localStorage.setItem(PROJECT_DIRECTORIES_STORAGE_KEY, JSON.stringify(projectDirectories));
+  localStorage.setItem(PROJECT_FOLDERS_STORAGE_KEY, JSON.stringify(projectFolders));
+}
+
+function scheduleProjectStorePersist(): void {
+  if (!isTauriRuntime()) {
+    persistProjectStoreToLocalStorage();
+    return;
+  }
+  if (projectStorePersistTimer !== null) return;
+  projectStorePersistTimer = window.setTimeout(() => {
+    projectStorePersistTimer = null;
+    void flushProjectStore();
+  }, 150);
+}
+
+async function flushProjectStore(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  projectStoreFlushInFlight = true;
+  try {
+    await backend.writeProjectStore({
+      directories: projectDirectories,
+      folders: projectFolders,
+    });
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "无法写入项目数据文件");
+  } finally {
+    projectStoreFlushInFlight = false;
+  }
+}
+
+function applyProjectStoreFile(file: ProjectStore, options: { notify?: boolean } = {}): boolean {
+  const directories = parseProjectDirectoriesValue(file.directories);
+  const folders = parseProjectFoldersValue(file.folders, directories);
+  if (
+    serializeProjectStoreData(directories, folders)
+    === serializeProjectStoreData(projectDirectories, projectFolders)
+  ) {
+    return false;
+  }
+  const previousFolderIds = new Set(projectFolders.map((folder) => folder.id));
+  projectDirectories = directories;
+  projectFolders = folders;
+  syncProjectFolderContacts();
+  for (const folderId of previousFolderIds) {
+    if (projectFolders.some((folder) => folder.id === folderId)) continue;
+    const contactId = projectContactId(folderId);
+    void disposeTerminalWorkspace(contactId);
+    messageDrafts.delete(contactId);
+  }
+  if (snapshot && isProjectContact() && !projectFolderForContact()) {
+    const fallback = snapshot.contacts.find((contact) => !isProjectContact(contact.id));
+    if (fallback) void selectContact(fallback.id);
+  }
+  renderContacts();
+  renderChatHeader();
+  if (options.notify) showToast("项目数据已随外部修改更新");
+  return true;
+}
+
+async function initProjectStore(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    projectStorePathLabel = await backend.projectStorePath();
+  } catch {
+    projectStorePathLabel = "";
+  }
+  let file: ProjectStore | null = null;
+  try {
+    file = await backend.readProjectStore();
+  } catch (error) {
+    projectStoreReadFailed = true;
+    showToast(
+      `项目数据文件无法读取（${error instanceof Error ? error.message : String(error)}），请修复后重新保存，界面会自动加载`,
+    );
+  }
+  if (file) {
+    applyProjectStoreFile(file);
+    localStorage.removeItem(PROJECT_DIRECTORIES_STORAGE_KEY);
+    localStorage.removeItem(PROJECT_FOLDERS_STORAGE_KEY);
+    return;
+  }
+  if (file === null && !projectStoreReadFailed) {
+    // 文件不存在：用当前数据（含本机旧 localStorage 数据）创建便携文件
+    try {
+      await backend.writeProjectStore({
+        directories: projectDirectories,
+        folders: projectFolders,
+      });
+    } catch (error) {
+      showToast(
+        `无法创建项目数据文件（${error instanceof Error ? error.message : String(error)}），项目改动暂未落盘`,
+      );
+    }
+  }
+}
+
+async function handleProjectStoreChange(retry = true): Promise<void> {
+  if (!isTauriRuntime() || projectStoreSyncing) return;
+  if (projectStorePersistTimer !== null || projectStoreFlushInFlight) return;
+  projectStoreSyncing = true;
+  try {
+    const file = await backend.readProjectStore();
+    if (!file) return;
+    applyProjectStoreFile(file, { notify: true });
+    localStorage.removeItem(PROJECT_DIRECTORIES_STORAGE_KEY);
+    localStorage.removeItem(PROJECT_FOLDERS_STORAGE_KEY);
+  } catch (error) {
+    if (retry) {
+      window.setTimeout(() => void handleProjectStoreChange(false), 800);
+      return;
+    }
+    showToast(`无法读取项目数据文件：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    projectStoreSyncing = false;
+  }
 }
 
 function createProjectFolderId(): string {
@@ -773,6 +931,7 @@ function projectFolderContact(folder: ProjectFolder): Contact {
 }
 
 function syncProjectFolderContacts(): void {
+  if (!snapshot) return;
   snapshot.contacts = snapshot.contacts
     .filter((contact) => !isProjectContact(contact.id))
     .concat(projectFolders.map(projectFolderContact));
@@ -2189,7 +2348,20 @@ function renderProjectFolders(): void {
   createButton.setAttribute("aria-label", "新建项目目录");
   createButton.innerHTML = icon("Plus", 14);
   createButton.addEventListener("click", () => openProjectDirectoryDialog());
-  toolbar.append(toolbarLabel, toolbarCount, createButton);
+  toolbar.append(toolbarLabel, toolbarCount);
+  if (isTauriRuntime()) {
+    const editStoreButton = document.createElement("button");
+    editStoreButton.type = "button";
+    editStoreButton.id = "edit-project-store";
+    editStoreButton.title = projectStorePathLabel
+      ? `在外部编辑项目数据（${projectStorePathLabel}），保存后自动生效`
+      : "在外部编辑项目数据，保存后自动生效";
+    editStoreButton.setAttribute("aria-label", "在外部编辑项目数据");
+    editStoreButton.innerHTML = icon("FilePen", 14);
+    editStoreButton.addEventListener("click", () => void openProjectStoreForEditing());
+    toolbar.append(editStoreButton);
+  }
+  toolbar.append(createButton);
   contactList.append(toolbar);
 
   const normalized = filterText.trim().toLocaleLowerCase();
@@ -2631,6 +2803,15 @@ async function openProjectFolderInOneCommander(folder: ProjectFolder): Promise<v
   }
 }
 
+async function openProjectStoreForEditing(): Promise<void> {
+  try {
+    await backend.openProjectStoreFile();
+    showToast("已打开项目数据文件，保存后界面会自动更新");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "无法打开项目数据文件");
+  }
+}
+
 async function addProjectFolder(): Promise<void> {
   const directoryId = pendingProjectDirectoryId;
   if (!directoryId || !projectDirectories.some((directory) => directory.id === directoryId)) {
@@ -3055,6 +3236,66 @@ function setTab(tab: RosterTab): void {
   renderContacts();
 }
 
+const rosterTabShortcuts: readonly RosterTab[] = ["friends", "groups", "recent"];
+
+function anyModalDialogOpen(): boolean {
+  return [
+    terminalRenameDialog,
+    projectDirectoryDialog,
+    projectFolderDialog,
+    projectRenameDialog,
+    projectRemoveDialog,
+    aboutDialog,
+    avatarDialog,
+  ].some((dialog) => !dialog.hidden);
+}
+
+function rosterShortcutRows(): HTMLButtonElement[] {
+  return [...contactList.querySelectorAll<HTMLButtonElement>(
+    ".contact-row, .project-folder-row",
+  )];
+}
+
+// Alt+↑/↓ 在列表内上下移动（好友、群组/项目文件夹、最近均可用），
+// 从终端或聊天输入框触发时，以当前选中项为锚点开始移动。
+function moveRosterSelection(step: 1 | -1): void {
+  const rows = rosterShortcutRows();
+  if (rows.length === 0) return;
+  if (rosterCollapsed) applyRosterCollapsed(false);
+  const focused = rows.indexOf(document.activeElement as HTMLButtonElement);
+  let index: number;
+  if (focused !== -1) {
+    index = (focused + step + rows.length) % rows.length;
+  } else {
+    const selected = rows.findIndex((row) => row.classList.contains("selected"));
+    index = selected === -1
+      ? (step === 1 ? 0 : rows.length - 1)
+      : (selected + step + rows.length) % rows.length;
+  }
+  const target = rows[index];
+  target.focus();
+  target.scrollIntoView({ block: "nearest" });
+}
+
+// 全局快捷键：Alt+1/2/3 切换 好友/群组/最近；Alt+↑/↓ 移动列表选中。
+// 注册在捕获阶段，确保终端（xterm）聚焦时也能生效。
+function handleGlobalRosterShortcut(event: KeyboardEvent): void {
+  if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if (event.isComposing || anyModalDialogOpen()) return;
+  if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    moveRosterSelection(event.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
+  const tabIndex = ["1", "2", "3"].indexOf(event.key);
+  if (tabIndex !== -1) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    setTab(rosterTabShortcuts[tabIndex]);
+  }
+}
+
 function insertAtCursor(text: string): void {
   const start = messageInput.selectionStart;
   const end = messageInput.selectionEnd;
@@ -3359,6 +3600,9 @@ function bindEvents(): void {
     event.preventDefault();
   });
 
+  // 捕获阶段注册，保证终端/输入框聚焦时 Alt+↑/↓、Alt+1/2/3 依然生效
+  document.addEventListener("keydown", handleGlobalRosterShortcut, { capture: true });
+
   document.querySelectorAll<HTMLButtonElement>(".menu-trigger").forEach((button) => {
     button.addEventListener("click", () => {
       const menu = button.dataset.menu;
@@ -3501,6 +3745,11 @@ function bindEvents(): void {
 async function start(): Promise<void> {
   refreshIcons();
   bindEvents();
+  if (isTauriRuntime()) {
+    void listen(PROJECT_STORE_CHANGED_EVENT, () => {
+      void handleProjectStoreChange();
+    });
+  }
   await applyPageZoom(currentZoom, false);
   applyRosterCollapsed(rosterCollapsed);
   void syncWindowState();
@@ -3519,6 +3768,7 @@ async function start(): Promise<void> {
   window.setInterval(updateClock, 1000);
   try {
     snapshot = await backend.bootstrap();
+    await initProjectStore();
     syncProjectFolderContacts();
     messages = snapshot.messages.filter(
       (message) => message.contactId === snapshot.activeContactId,

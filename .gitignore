@@ -7,4 +7,6 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 *.log
+*.json.tmp
+project-folders.json
 tests/ai-status/out/
