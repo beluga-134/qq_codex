@@ -168,6 +168,15 @@ type TerminalLayoutNode =
       second: TerminalLayoutNode;
     };
 
+/** xterm 链接提供器需要的图片标记链接描述 */
+type XtermImageLink = {
+  range: { start: { x: number; y: number }; end: { x: number; y: number } };
+  text: string;
+  activate: () => void;
+  hover: (event: MouseEvent) => void;
+  leave: () => void;
+};
+
 interface TerminalPaneRuntime {
   workspace: TerminalWorkspace;
   id: number;
@@ -177,6 +186,7 @@ interface TerminalPaneRuntime {
   closeButton: HTMLButtonElement;
   terminal: XtermTerminal;
   fit: FitAddon;
+  extractor: PtyImageExtractor | null;
   resizeObserver: ResizeObserver | null;
   sessionId: number | null;
   openPromise: Promise<void> | null;
@@ -989,14 +999,574 @@ async function copyTerminalSelection(pane: TerminalPaneRuntime): Promise<void> {
 
 async function pasteTerminalClipboard(pane: TerminalPaneRuntime): Promise<void> {
   try {
+    // 剪贴板里是图片时，转发 pi 的图片粘贴键（Alt+V = ESC v）到 PTY，
+    // 由 pi 自己读取 Windows 剪贴板落盘并插入附件标记，实现与文本粘贴同键。
+    if (navigator.clipboard?.read) {
+      try {
+        const items = await navigator.clipboard.read();
+        const hasImage = items.some((item) => item.types.some((type) => type.startsWith("image/")));
+        if (hasImage) {
+          if (isTauriRuntime()) queuePanePtyWrite(pane, new TextEncoder().encode("\x1bv"));
+          return;
+        }
+      } catch {
+        // read() 不可用（权限/环境限制）时退回文本粘贴逻辑
+      }
+    }
     if (!navigator.clipboard?.readText) throw new Error("当前环境不支持读取剪贴板");
     const text = await navigator.clipboard.readText();
-    if (text) pane.terminal.paste(text);
+    if (text) {
+      pane.terminal.paste(text);
+    } else if (isTauriRuntime()) {
+      // 文本为空但用户主动粘贴：大概率是截图类图片，交给 pi 自行判断剪贴板内容
+      queuePanePtyWrite(pane, new TextEncoder().encode("\x1bv"));
+    }
   } catch (error) {
     showToast(error instanceof Error ? error.message : "粘贴终端内容失败");
   } finally {
     pane.terminal.focus();
   }
+}
+
+/** 从 PTY 字节流中拦截 iTerm2 内联图片序列（ESC ] 1337 ; File=... : base64 BEL/ESC\），
+ * 图片字节落盘，完整路径写回终端流供悬浮预览，其余字节原样透传给 xterm。跨 chunk 状态机。 */
+class PtyImageExtractor {
+  private tail: number[] = [];
+  private state:
+    | "collect"
+    | "esc"
+    | "head"
+    | "header"
+    | "payload"
+    | "term"
+    | "termEsc"
+    | "passthrough"
+    | "passthroughEsc" = "collect";
+  private match = 0;
+  private headerText = "";
+  private payloadChunks: Uint8Array[] = [];
+  private payloadLeft = 0;
+  private seq = 0;
+  private lastMarker: string | null = null;
+  private readonly decorator: ImagePathDecorator;
+
+  private static readonly FULL_HEAD = [
+    0x1b, 0x5d, 0x31, 0x33, 0x33, 0x37, 0x3b, 0x46, 0x69, 0x6c, 0x65, 0x3d,
+  ]; // ESC ] 1 3 3 7 ; F i l e =
+  private static readonly MAX_HEADER = 4096;
+  private static readonly MAX_PAYLOAD = 64 * 1024 * 1024;
+
+  constructor(
+    private readonly ownerId: number,
+    private readonly onImage: (bytes: Uint8Array, path: string) => void,
+    onText: (text: string) => void,
+  ) {
+    this.decorator = new ImagePathDecorator(onText);
+  }
+
+  write(data: Uint8Array): void {
+    let plain: number[] = [];
+    const flush = () => {
+      if (plain.length > 0) {
+        this.decorator.push(Uint8Array.from(plain));
+        plain = [];
+      }
+    };
+    let i = 0;
+    const n = data.length;
+    while (i < n) {
+      const b = data[i];
+      switch (this.state) {
+        case "collect": {
+          if (b === 0x1b) {
+            flush();
+            this.tail = [b];
+            this.match = 1;
+            this.state = "head";
+          } else plain.push(b);
+          i += 1;
+          break;
+        }
+        case "head": {
+          if (this.match === 1) {
+            // ESC 后第一个字节：只有 ']' 才是 OSC；其余（如 CSI 的 '['）原样放行
+            this.tail.push(b);
+            if (b === 0x5d) {
+              this.match = 2;
+            } else {
+              this.tailTo(plain);
+              this.state = "collect";
+            }
+            i += 1;
+            break;
+          }
+          if (this.match < PtyImageExtractor.FULL_HEAD.length && b === PtyImageExtractor.FULL_HEAD[this.match]) {
+            this.tail.push(b);
+            this.match += 1;
+            if (this.match === PtyImageExtractor.FULL_HEAD.length) {
+              this.headerText = "";
+              this.state = "header";
+            }
+          } else {
+            // 确认是 OSC 但不是 1337;File=：整段透传（含负载直到 BEL 或 ESC\）
+            this.tail.push(b);
+            if (b === 0x07) {
+              this.tailTo(plain);
+              this.state = "collect";
+            } else {
+              this.state = b === 0x1b ? "passthroughEsc" : "passthrough";
+            }
+          }
+          i += 1;
+          break;
+        }
+        case "header": {
+          this.tail.push(b);
+          if (b === 0x3a) {
+            const size = /size=(\d+)/.exec(this.headerText);
+            const need = size ? Number.parseInt(size[1], 10) : -1;
+            if (need > 0 && need <= PtyImageExtractor.MAX_PAYLOAD) {
+              this.payloadLeft = need;
+              this.payloadChunks = [];
+              this.state = "payload";
+            } else {
+              this.tailTo(plain);
+              this.state = "passthrough";
+            }
+          } else {
+            this.headerText += String.fromCharCode(b);
+            if (this.headerText.length > PtyImageExtractor.MAX_HEADER) {
+              this.tailTo(plain);
+              this.state = "passthrough";
+            }
+          }
+          i += 1;
+          break;
+        }
+        case "payload": {
+          const take = Math.min(this.payloadLeft, n - i);
+          this.payloadChunks.push(data.slice(i, i + take));
+          this.payloadLeft -= take;
+          i += take;
+          if (this.payloadLeft === 0) this.state = "term";
+          break;
+        }
+        case "term": {
+          if (b === 0x07) {
+            this.fire();
+            this.emitMarker(plain);
+            this.state = "collect";
+          } else if (b === 0x1b) {
+            this.state = "termEsc";
+          } else {
+            this.fire();
+            this.emitMarker(plain);
+            plain.push(b);
+            this.state = "collect";
+          }
+          i += 1;
+          break;
+        }
+        case "termEsc": {
+          if (b === 0x5c) {
+            this.fire();
+            this.emitMarker(plain);
+            this.state = "collect";
+          } else {
+            this.fire();
+            this.emitMarker(plain);
+            this.tail.push(b);
+            this.tailTo(plain);
+            this.state = "collect";
+          }
+          i += 1;
+          break;
+        }
+        case "passthrough": {
+          this.tail.push(b);
+          if (b === 0x07) {
+            this.tailTo(plain);
+            this.state = "collect";
+          } else if (b === 0x1b) {
+            this.state = "passthroughEsc";
+          }
+          i += 1;
+          break;
+        }
+        case "passthroughEsc": {
+          this.tail.push(b);
+          this.tailTo(plain);
+          this.state = "collect";
+          i += 1;
+          break;
+        }
+      }
+    }
+    flush();
+  }
+
+  dispose(): void {
+    this.decorator.dispose();
+  }
+
+  private tailTo(plain: number[]): void {
+    plain.push(...this.tail);
+    this.tail = [];
+  }
+
+  /** 图片剥离后，在原位置注入青绿色短标记（纯文本，随文字 reflow，永不被截断） */
+  private emitMarker(plain: number[]): void {
+    if (!this.lastMarker) return;
+    plain.push(...new TextEncoder().encode(this.lastMarker));
+    this.lastMarker = null;
+  }
+
+  private fire(): void {
+    this.tail = [];
+    this.lastMarker = null;
+    try {
+      const total = this.payloadChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const base64Bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of this.payloadChunks) {
+        base64Bytes.set(chunk, offset);
+        offset += chunk.length;
+      }
+      this.payloadChunks = [];
+      let binary = "";
+      const block = 0x8000;
+      for (let i = 0; i < total; i += block) {
+        binary += String.fromCharCode(...base64Bytes.subarray(i, Math.min(i + block, total)));
+      }
+      const raw = atob(binary);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+      this.seq += 1;
+      const path = `/tmp/qq-img-${this.ownerId}-${this.seq}.${sniffImageExtension(bytes)}`;
+      // 提示语由 ImagePathDecorator 统一追加（对一切识别到的图片路径生效）
+      this.lastMarker = `\x1b[36m${path}\x1b[0m`;
+      this.onImage(bytes, path);
+    } catch {
+      // 解码失败则丢弃该张图片，不影响终端流
+    }
+  }
+}
+
+let hoverPreviewEl: HTMLElement | null = null;
+let hoverPreviewPinned = false;
+let hoverPreviewPath = "";
+
+/** 终端里可悬浮预览的图片路径（POSIX 绝对路径 / Windows 盘符 / UNC） */
+const IMAGE_PATH_REGEX =
+  /(?:\\\\[^\s"'<>|]+|[A-Za-z]:\\[^\s"'<>|]+|\/[^\s"'<>|]+)\.(?:png|jpe?g|gif|webp|bmp)/gi;
+/** 图片路径后追加的深绿色括号提示 */
+const IMAGE_HINT_ANSI = "\x1b[32m（鼠标悬浮预览，点击查看大图/保存）\x1b[0m";
+/** 不会出现在路径字符集里的字符（视为路径边界） */
+const IMAGE_PATH_BOUNDARY = /[\s"'<>|]/;
+
+function decorateImagePaths(text: string): string {
+  IMAGE_PATH_REGEX.lastIndex = 0;
+  return text.replace(IMAGE_PATH_REGEX, (match) =>
+    match.includes("://") ? match : match + IMAGE_HINT_ANSI,
+  );
+}
+
+/** 纯文本流装饰器：在完整识别出的图片路径后追加绿色提示。
+ * 路径可能跨 PTY chunk 分裂：末尾可能仍在生长的“路径尾巴”暂存不吐，
+ * 待边界字符（空白/引号等）确认后一并装饰输出；≤8 字节的小 chunk 视为
+ * 交互键入，立即原样透出（避免键入回显被扣住不显示），也不装饰。 */
+class ImagePathDecorator {
+  private buf = "";
+  private timer: number | null = null;
+  private readonly decoder = new TextDecoder();
+
+  constructor(
+    private readonly emit: (text: string) => void,
+    private readonly timeoutMs = 60,
+  ) {}
+
+  push(chunk: Uint8Array): void {
+    if (chunk.length === 0) return;
+    this.cancelTimer();
+    if (chunk.length <= 8) {
+      this.flushRaw();
+      this.emit(this.decoder.decode(chunk, { stream: true }));
+      return;
+    }
+    this.buf += this.decoder.decode(chunk, { stream: true });
+    this.commit();
+    if (this.buf.length > 0) {
+      // 超时兑底：流停止时把残留尾巴原样吐出，避免末尾文本永远不显示
+      this.timer = window.setTimeout(() => {
+        this.timer = null;
+        this.flushRaw();
+      }, this.timeoutMs);
+    }
+  }
+
+  dispose(): void {
+    this.cancelTimer();
+    this.buf = "";
+  }
+
+  private cancelTimer(): void {
+    if (this.timer !== null) {
+      window.clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private flushRaw(): void {
+    if (this.buf.length === 0) return;
+    const rest = this.buf;
+    this.buf = "";
+    this.emit(rest);
+  }
+
+  private commit(): void {
+    if (this.buf.length === 0) return;
+    let lastBoundary = -1;
+    for (let i = this.buf.length - 1; i >= 0; i -= 1) {
+      if (IMAGE_PATH_BOUNDARY.test(this.buf[i])) {
+        lastBoundary = i;
+        break;
+      }
+    }
+    const tail = this.buf.slice(lastBoundary + 1);
+    // 只有尾巴还可能长成图片路径时才暂存（含 / 或 \，或是潜在盘符前缀）
+    const holdable = tail.length <= 1024
+      && (tail.includes("/") || tail.includes("\\") || /^[A-Za-z]?:?$/.test(tail));
+    if (!holdable) {
+      this.flushDecorated(this.buf);
+      return;
+    }
+    if (lastBoundary >= 0) this.flushDecorated(this.buf.slice(0, lastBoundary + 1));
+    this.buf = tail;
+  }
+
+  private flushDecorated(text: string): void {
+    this.buf = this.buf.slice(text.length);
+    this.emit(decorateImagePaths(text));
+  }
+}
+
+/** 路径 → data: URL 缓存：磁盘读取结果复用，避免每次悬浮都读文件 */
+const terminalImageCache = new Map<string, string>();
+
+function cacheTerminalImage(path: string, url: string): void {
+  terminalImageCache.delete(path);
+  terminalImageCache.set(path, url);
+  while (terminalImageCache.size > 24) {
+    const oldest = terminalImageCache.keys().next().value;
+    if (oldest === undefined) break;
+    terminalImageCache.delete(oldest);
+  }
+}
+
+/** 读取磁盘图片为 data: URL；刚写入的文件可能落盘稍慢，短重试一次 */
+async function resolveTerminalImage(path: string): Promise<string> {
+  const cached = terminalImageCache.get(path);
+  if (cached) return cached;
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const url = await backend.readTerminalImage(path);
+      cacheTerminalImage(path, url);
+      return url;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => window.setTimeout(resolve, 300));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** 悬浮路径：读盘后弹瞬时预览；文件不可读时静默，避免误悬浮打扰 */
+async function previewTerminalImage(path: string, event: MouseEvent): Promise<void> {
+  try {
+    const url = await resolveTerminalImage(path);
+    showHoverPreview(url, path, event);
+  } catch {
+    // 文件不存在（如 /tmp 已清理）：不弹预览
+  }
+}
+
+/** 点击路径：读盘后弹固定面板（查看大图/固定/保存） */
+async function openPinnedImagePanel(path: string): Promise<void> {
+  try {
+    const url = await resolveTerminalImage(path);
+    showPinnedImagePanel(url, path);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "读取图片失败");
+  }
+}
+
+/** 保存终端图片到宿主图片文件夹（Windows：图片\qq_codex） */
+async function saveTerminalImageAs(path: string): Promise<void> {
+  if (!path) return;
+  try {
+    const target = await backend.exportTerminalImage(path);
+    showToast(`已保存：${target}`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "保存图片失败");
+  }
+}
+
+/** 图片浮窗：悬浮=瞬时预览；点击路径=pinned 模式（查看大图/固定/保存/关闭） */
+function showHoverPreview(url: string, path: string, event: MouseEvent, pinned = false): void {
+  let el = hoverPreviewEl;
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "image-hover-preview";
+    const bar = document.createElement("div");
+    bar.className = "image-hover-preview-bar";
+    const pathLabel = document.createElement("span");
+    pathLabel.className = "image-hover-preview-path";
+    const view = document.createElement("button");
+    view.type = "button";
+    view.className = "image-hover-preview-btn";
+    view.textContent = "🔍 查看大图";
+    view.title = "高分辨率查看";
+    const pin = document.createElement("button");
+    pin.type = "button";
+    pin.className = "image-hover-preview-btn image-hover-preview-pin";
+    pin.textContent = "📌 固定";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "image-hover-preview-btn";
+    save.textContent = "💾 保存";
+    save.title = "保存到图片文件夹";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "image-hover-preview-btn";
+    close.textContent = "✕";
+    bar.append(pathLabel, view, pin, save, close);
+    const img = document.createElement("img");
+    el.append(bar, img);
+    document.body.append(el);
+    hoverPreviewEl = el;
+
+    view.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      showImageZoomViewer(img.src);
+    });
+    pin.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      hoverPreviewPinned = !hoverPreviewPinned;
+      pin.textContent = hoverPreviewPinned ? "📌 已固定" : "📌 固定";
+      el?.classList.toggle("pinned", hoverPreviewPinned);
+    });
+    save.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      void saveTerminalImageAs(hoverPreviewPath);
+    });
+    close.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      hoverPreviewPinned = false;
+      pin.textContent = "📌 固定";
+      if (hoverPreviewEl) hoverPreviewEl.hidden = true;
+    });
+    img.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      showImageZoomViewer(img.src);
+    });
+  }
+  const img = el.querySelector("img");
+  if (img && img.getAttribute("src") !== url) img.src = url;
+  const pathLabel = el.querySelector(".image-hover-preview-path");
+  if (pathLabel) pathLabel.textContent = path;
+  hoverPreviewPath = path;
+  hoverPreviewPinned = pinned;
+  const pinButton = el.querySelector(".image-hover-preview-pin");
+  if (pinButton) pinButton.textContent = pinned ? "📌 已固定" : "📌 固定";
+  el.classList.toggle("pinned", pinned);
+  el.hidden = false;
+  const boxWidth = 460;
+  const boxHeight = 380;
+  const pad = 14;
+  let x = event.clientX + pad;
+  let y = event.clientY + pad;
+  if (x + boxWidth > window.innerWidth - 8) x = event.clientX - boxWidth - pad;
+  if (y + boxHeight > window.innerHeight - 8) y = Math.max(8, event.clientY - boxHeight - pad);
+  el.style.left = `${Math.max(8, x)}px`;
+  el.style.top = `${Math.max(8, y)}px`;
+}
+
+function hideHoverPreview(): void {
+  if (hoverPreviewEl && !hoverPreviewPinned) hoverPreviewEl.hidden = true;
+}
+
+/** 点击路径：在屏幕中心弹出固定模式的图片面板（查看大图/固定/保存） */
+function showPinnedImagePanel(url: string, path: string): void {
+  const el = hoverPreviewEl;
+  if (!el || el.hidden) {
+    showHoverPreview(url, path, {
+      clientX: Math.max(60, window.innerWidth / 2 - 230),
+      clientY: Math.max(60, window.innerHeight / 2 - 190),
+    } as MouseEvent, true);
+    return;
+  }
+  const img = el.querySelector("img");
+  if (img) img.src = url;
+  const pathLabel = el.querySelector(".image-hover-preview-path");
+  if (pathLabel) pathLabel.textContent = path;
+  hoverPreviewPinned = true;
+  el.classList.add("pinned");
+  el.hidden = false;
+}
+
+function sniffImageExtension(bytes: Uint8Array): string {
+  if (bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e) return "png";
+  if (bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8) return "jpg";
+  if (bytes.length > 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "gif";
+  if (bytes.length > 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[8] === 0x57) return "webp";
+  return "png";
+}
+
+/** 终端图片落盘：完整路径已写入终端流，这里把字节写入 WSL /tmp 供悬浮预览/保存 */
+function persistTerminalImage(pane: TerminalPaneRuntime, bytes: Uint8Array, path: string): void {
+  if (pane.disposed || !isTauriRuntime()) return;
+  void backend
+    .saveTerminalImage(bytes, path.split("/").pop() ?? "qq-img.png")
+    .catch(() => undefined);
+}
+
+/** 高分辨率查看器：屏幕中心 1/4 面积，1:1 像素展示，滚轮/滚动条平移，点击空白或 Esc 关闭 */
+function showImageZoomViewer(src: string): void {
+  const overlay = document.createElement("div");
+  overlay.className = "terminal-image-zoom";
+  const caption = document.createElement("div");
+  caption.className = "terminal-image-zoom-caption";
+  caption.textContent = "高分辨率预览";
+  const frame = document.createElement("div");
+  frame.className = "terminal-image-zoom-frame";
+  const inner = document.createElement("div");
+  inner.className = "terminal-image-zoom-inner";
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = "高分辨率图片";
+  img.addEventListener("load", () => {
+    caption.textContent = `${img.naturalWidth} × ${img.naturalHeight} · 1:1 像素 · 滚动查看细节 · 点击空白或 Esc 关闭`;
+  });
+  const close = () => {
+    overlay.remove();
+    window.removeEventListener("keydown", onKey, true);
+  };
+  const onKey = (keyEvent: KeyboardEvent) => {
+    if (keyEvent.key === "Escape") {
+      keyEvent.preventDefault();
+      keyEvent.stopPropagation();
+      close();
+    }
+  };
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) close();
+  });
+  window.addEventListener("keydown", onKey, true);
+  inner.append(img);
+  frame.append(inner);
+  overlay.append(caption, frame);
+  document.body.appendChild(overlay);
 }
 
 function handleTerminalClipboardShortcut(
@@ -1444,7 +2014,8 @@ async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
           pane.workspace.panes.get(pane.id) === pane
         ) {
           const bytes = ptyBytes(data);
-          pane.terminal.write(bytes);
+          if (pane.extractor) pane.extractor.write(bytes);
+          else pane.terminal.write(bytes);
           feedPaneAiActivity(pane, bytes);
         }
       },
@@ -1748,6 +2319,8 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
   });
   const fit = new FitAddon();
   terminal.loadAddon(fit);
+  // 终端不渲染图片本体：OSC 1337 被拦截后只把落盘文件的完整路径写入
+  // 终端流，悬浮路径预览、点击路径查看大图/固定/保存（见下方 link provider）。
   const pane: TerminalPaneRuntime = {
     workspace,
     id,
@@ -1757,6 +2330,7 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
     closeButton,
     terminal,
     fit,
+    extractor: null,
     resizeObserver: null,
     sessionId: null,
     openPromise: null,
@@ -1778,6 +2352,50 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
     aiDoneTimer: null,
   };
   terminal.attachCustomKeyEventHandler((event) => handleTerminalClipboardShortcut(pane, event));
+  pane.extractor = new PtyImageExtractor(
+    id,
+    (bytes, path) => persistTerminalImage(pane, bytes, path),
+    (text) => {
+      // 装饰器可能异步（起时器）吐出残留尾巴：写入前确认窗格仍存活
+      if (pane.disposed || pane.workspace.panes.get(pane.id) !== pane) return;
+      pane.terminal.write(text);
+    },
+  );
+  // 图片路径链接：悬浮弹浮窗预览，点击进固定面板（查看大图/固定/保存）
+  pane.disposables.push(
+    terminal.registerLinkProvider({
+      provideLinks: (line, callback) => {
+        try {
+          // xterm 传入的行号是 1-based（内部 OSC 链接器同样用 line - 1 取行）
+          const lineBuffer = terminal.buffer.active.getLine(line - 1);
+          if (!lineBuffer) return callback(undefined);
+          const text = lineBuffer.translateToString(true);
+          IMAGE_PATH_REGEX.lastIndex = 0;
+          const links: XtermImageLink[] = [];
+          const seen = new Set<string>();
+          for (const match of text.matchAll(IMAGE_PATH_REGEX)) {
+            const path = match[0];
+            const column = match.index ?? -1;
+            if (column < 0 || seen.has(path) || path.includes("://")) continue;
+            seen.add(path);
+            links.push({
+              range: {
+                start: { x: column + 1, y: line },
+                end: { x: column + 1 + path.length, y: line },
+              },
+              text: path,
+              activate: () => void openPinnedImagePanel(path),
+              hover: (hoverEvent) => void previewTerminalImage(path, hoverEvent),
+              leave: () => hideHoverPreview(),
+            });
+          }
+          callback(links.length > 0 ? (links as never) : undefined);
+        } catch {
+          callback(undefined);
+        }
+      },
+    }),
+  );
   element.addEventListener(
     "mousedown",
     (event) => {
@@ -1907,6 +2525,8 @@ async function disposeTerminalPane(
     window.clearTimeout(pane.aiDoneTimer);
     pane.aiDoneTimer = null;
   }
+  pane.extractor?.dispose();
+  pane.extractor = null;
   pane.resizeObserver?.disconnect();
   pane.resizeObserver = null;
   pane.disposables.splice(0).forEach((disposable) => disposable.dispose());

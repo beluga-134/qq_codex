@@ -1500,6 +1500,108 @@ svg {
   background: var(--paper);
 }
 
+.image-hover-preview {
+  position: fixed;
+  z-index: 9998;
+  width: 460px;
+  max-height: 380px;
+  overflow: hidden;
+  background: var(--paper);
+  border: 2px solid var(--control-light);
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
+.image-hover-preview.pinned {
+  pointer-events: auto;
+  z-index: 9997;
+  border-color: var(--accent, #1e4f9b);
+}
+
+.image-hover-preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  background: var(--control-light);
+  pointer-events: auto;
+  flex-wrap: wrap;
+}
+
+.image-hover-preview-path {
+  flex: 1;
+  min-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 12px/1.6 inherit;
+  color: var(--control);
+}
+
+.image-hover-preview-btn {
+  font: 12px/1.4 inherit;
+  color: #000;
+  background: var(--paper);
+  border: 1px solid var(--control);
+  cursor: pointer;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+.image-hover-preview-btn:hover {
+  background: var(--control-light);
+}
+
+.image-hover-preview img {
+  display: block;
+  width: 100%;
+  height: auto;
+  cursor: zoom-in;
+}
+
+.terminal-image-zoom {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: rgba(20, 24, 28, 0.82);
+  cursor: zoom-out;
+}
+
+.terminal-image-zoom-caption {
+  color: #fffdf3;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.terminal-image-zoom-frame {
+  width: 50vw;
+  height: 50vh;
+  overflow: auto;
+  background: var(--paper);
+  border: 2px solid var(--control-light);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.45);
+  cursor: auto;
+}
+
+.terminal-image-zoom-inner {
+  min-width: 100%;
+  min-height: 100%;
+  width: max-content;
+  height: max-content;
+  display: grid;
+  place-items: center;
+}
+
+.terminal-image-zoom-frame img {
+  max-width: none;
+  display: block;
+}
+
 .terminal-divider {
   position: relative;
   z-index: 3;

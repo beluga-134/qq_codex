@@ -641,6 +641,26 @@ export const backend = {
     });
   },
 
+  async saveTerminalImage(bytes: Uint8Array, fileName: string): Promise<string> {
+    if (!isTauri() || bytes.length === 0) return "";
+    return invoke<string>("save_terminal_image", {
+      bytes: Array.from(bytes),
+      fileName,
+    });
+  },
+
+  /** 读取终端图片文件，返回 data: URL（悬浮预览/大图查看用） */
+  async readTerminalImage(path: string): Promise<string> {
+    if (!isTauri()) throw new Error("仅桌面版支持查看终端图片");
+    return invoke<string>("read_terminal_image", { path });
+  },
+
+  /** 把终端图片保存到宿主图片文件夹，返回保存路径 */
+  async exportTerminalImage(path: string): Promise<string> {
+    if (!isTauri()) throw new Error("仅桌面版支持保存终端图片");
+    return invoke<string>("export_terminal_image", { path });
+  },
+
   async resizePty(sessionId: number, rows: number, cols: number): Promise<void> {
     if (!isTauri()) return;
     return invoke<void>("pty_resize", {
