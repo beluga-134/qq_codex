@@ -655,6 +655,12 @@ export const backend = {
     return invoke<string>("read_terminal_image", { path });
   },
 
+  /** 读取终端图片文件信息（mtime/size），悬浮缓存失效判定用 */
+  async statTerminalImage(path: string): Promise<{ mtimeMs: number; size: number }> {
+    if (!isTauri()) throw new Error("仅桌面版支持查看终端图片");
+    return invoke<{ mtimeMs: number; size: number }>("stat_terminal_image", { path });
+  },
+
   /** 把终端图片保存到宿主图片文件夹，返回保存路径 */
   async exportTerminalImage(path: string): Promise<string> {
     if (!isTauri()) throw new Error("仅桌面版支持保存终端图片");

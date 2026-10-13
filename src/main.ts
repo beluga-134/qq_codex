@@ -1350,12 +1350,17 @@ class ImagePathDecorator {
   }
 }
 
-/** 路径 → data: URL 缓存：磁盘读取结果复用，避免每次悬浮都读文件 */
-const terminalImageCache = new Map<string, string>();
+/** 路径 → data: URL 缓存：带 mtime/size 失效判定，同名文件重绘后悬浮自动刷新 */
+interface CachedTerminalImage {
+  url: string;
+  mtimeMs: number;
+  size: number;
+}
+const terminalImageCache = new Map<string, CachedTerminalImage>();
 
-function cacheTerminalImage(path: string, url: string): void {
+function cacheTerminalImage(path: string, entry: CachedTerminalImage): void {
   terminalImageCache.delete(path);
-  terminalImageCache.set(path, url);
+  terminalImageCache.set(path, entry);
   while (terminalImageCache.size > 24) {
     const oldest = terminalImageCache.keys().next().value;
     if (oldest === undefined) break;
@@ -1363,15 +1368,35 @@ function cacheTerminalImage(path: string, url: string): void {
   }
 }
 
-/** 读取磁盘图片为 data: URL；刚写入的文件可能落盘稍慢，短重试一次 */
+/** 读磁盘图片为 data: URL：先 stat 比对 mtime/size，未变才用缓存；
+ *  变了（脚本同名覆盖重绘）则重读并刷新缓存；读后再次 stat 取最终戳，
+ *  防止读到的内容比读前 stat 更新时把新图配旧戳 */
 async function resolveTerminalImage(path: string): Promise<string> {
+  let stat: { mtimeMs: number; size: number } | null = null;
+  try {
+    stat = await backend.statTerminalImage(path);
+  } catch {
+    stat = null; // stat 不可用时退化为直读
+  }
   const cached = terminalImageCache.get(path);
-  if (cached) return cached;
+  if (cached && stat && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.url;
+  }
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const url = await backend.readTerminalImage(path);
-      cacheTerminalImage(path, url);
+      let stamp = stat;
+      try {
+        stamp = await backend.statTerminalImage(path);
+      } catch {
+        // 保留读前 stat；拿不到就用零值（下次悬浮会再重读一次，无害）
+      }
+      cacheTerminalImage(path, {
+        url,
+        mtimeMs: stamp?.mtimeMs ?? 0,
+        size: stamp?.size ?? 0,
+      });
       return url;
     } catch (error) {
       lastError = error;

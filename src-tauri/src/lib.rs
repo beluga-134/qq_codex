@@ -1552,6 +1552,29 @@ fn read_terminal_image(path: String) -> Result<String, String> {
     ))
 }
 
+/// 悬浮预览缓存失效判定用：返回终端图片文件的修改时间与大小（不读文件内容）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalImageStat {
+    mtime_ms: i64,
+    size: u64,
+}
+
+#[tauri::command(async)]
+fn stat_terminal_image(path: String) -> Result<TerminalImageStat, String> {
+    let path = validated_terminal_image_path(&path)?;
+    let host_path = resolve_terminal_image_path(path)?;
+    let meta =
+        std::fs::metadata(&host_path).map_err(|e| format!("读取图片信息失败：{e}"))?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+        .unwrap_or(0);
+    Ok(TerminalImageStat { mtime_ms, size: meta.len() })
+}
+
 fn export_terminal_image_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     if let Ok(profile) = std::env::var("USERPROFILE") {
@@ -2103,6 +2126,7 @@ pub fn run() {
             pty_close,
             save_terminal_image,
             read_terminal_image,
+            stat_terminal_image,
             export_terminal_image,
             mark_read,
             set_presence
