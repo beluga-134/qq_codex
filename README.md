@@ -51,6 +51,18 @@ REM 构建前端并执行 Rust 测试、检查
 
 在项目终端里运行 codex、Claude Code 或 pi 等 AI CLI 时，左侧对应的项目文件夹会显示实时状态：整行填充浅色底色并随状态脉动——黄色呼吸表示 AI 正在工作，红色闪烁表示等待审批，绿色短暂常亮表示已完成；行首竖条与文件夹角标同步显示同色。检测基于终端输出启发式，匹配失败时静默降级，不影响终端本身。
 
+## 便携配置（project-folders.json / notes.json / open-with.json）
+
+以下文件都在 exe 同目录、不进仓库（.gitignore），拷贝 exe + 这几个 json 即可在另一台电脑带走全部数据：
+
+- `project-folders.json`：群组与项目文件夹（见下节）
+- `notes.json`：右侧便签，按联系人/项目分键
+- `open-with.json`：打开器配置。`openFolderWith` 配置双击项目标签的文件夹打开器；
+  `openFileWith` 配置终端里点击文件路径的指定打开器——键为小写扩展名（如 `.md`）或
+  `default` 兜底，值为 `{ "exe": "程序路径", "args": ["{path}"] }`（`exe` 支持相对本 exe
+  目录的相对路径，`{path}` 替换为文件宿主路径，WSL 路径自动映射 UNC）；
+  未命中配置时回落系统默认关联程序；文件每次点击时现读，保存即生效。
+
 ## 便携项目数据（project-folders.json）
 
 左侧群组里的项目目录和项目文件夹不再绑定本机 WebView 存储，而是保存在 exe 同目录的 `project-folders.json`：

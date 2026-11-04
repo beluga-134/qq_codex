@@ -355,6 +355,10 @@ pub(crate) struct FolderOpener {
 pub(crate) struct FolderOpenerConfig {
     #[serde(default)]
     open_folder_with: Option<FolderOpener>,
+    /// 终端点击文件路径的指定打开器：键为小写扩展名（如 ".md"）或 "default"，
+    /// 值与 openFolderWith 同构；未命中/未配置回落系统默认关联程序
+    #[serde(default)]
+    open_file_with: Option<std::collections::HashMap<String, FolderOpener>>,
 }
 
 pub(crate) fn folder_opener_config_path() -> Option<PathBuf> {
@@ -368,6 +372,38 @@ pub(crate) fn load_folder_opener() -> Option<FolderOpener> {
     let raw = std::fs::read_to_string(&path).ok()?;
     let config: FolderOpenerConfig = serde_json::from_str(raw.trim_start_matches('\u{FEFF}')).ok()?;
     config.open_folder_with
+}
+
+/// 按文件扩展名找 openFileWith 配置的打开器：先精确匹配 ".md" 等小写扩展名键，
+/// 无则查 "default" 键；都没有返回 None（调用方回落系统默认关联程序）。
+fn load_file_opener(extension: &str) -> Option<FolderOpener> {
+    let path = folder_opener_config_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let config: FolderOpenerConfig = serde_json::from_str(raw.trim_start_matches('\u{FEFF}')).ok()?;
+    let table = config.open_file_with?;
+    if !extension.is_empty() {
+        if let Some(opener) = table.get(&extension.to_ascii_lowercase()) {
+            return Some(opener.clone());
+        }
+    }
+    table.get("default").cloned()
+}
+
+/// 用 openFileWith 配置打开终端文件；返回 Ok(false)=无配置（调用方走系统默认），
+/// Err=配置存在但启动失败（用户显式写的配置，失败必须报错可见）。
+#[cfg(target_os = "windows")]
+pub(crate) fn open_file_with_configured_opener(host_path: &str) -> Result<bool, String> {
+    let extension = std::path::Path::new(host_path)
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+    match load_file_opener(&extension) {
+        Some(opener) => {
+            launch_folder_opener(&opener, host_path)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// 用配置的打开器启动项目文件夹；配置是用户显式写的，失败必须报错可见

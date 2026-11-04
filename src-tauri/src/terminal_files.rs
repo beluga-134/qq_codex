@@ -141,10 +141,23 @@ pub(crate) fn open_terminal_file(path: String) -> Result<String, String> {
         return Err(format!("文件不存在：{path}"));
     }
     #[cfg(target_os = "windows")]
-    let spawn = std::process::Command::new("explorer.exe").arg(&host_path).spawn();
+    {
+        // open-with.json 的 openFileWith 节优先：按扩展名指定打开器；未配置走系统默认
+        match crate::projects::open_file_with_configured_opener(&host_path.to_string_lossy()) {
+            Ok(true) => return Ok(host_path.to_string_lossy().replace('\\', "/")),
+            Err(error) => return Err(error),
+            Ok(false) => {}
+        }
+        let spawn = std::process::Command::new("explorer.exe").arg(&host_path).spawn();
+        spawn.map_err(|e| format!("打开失败：{e}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let spawn = std::process::Command::new("xdg-open").arg(&host_path).spawn();
+        spawn.map_err(|e| format!("打开失败：{e}"))?;
+    }
     #[cfg(not(target_os = "windows"))]
     let spawn = std::process::Command::new("xdg-open").arg(&host_path).spawn();
-    spawn.map_err(|e| format!("打开失败：{e}"))?;
     Ok(host_path.to_string_lossy().replace('\\', "/"))
 }
 
