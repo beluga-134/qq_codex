@@ -1026,8 +1026,20 @@ svg {
   background: #28b04a;
 }
 
+/* 整行状态底色：未选中时整行填充对应颜色（呼吸/闪烁/常亮）；
+   选中行保持蓝色选中高亮，状态仍由左侧竖条 + 图标圆点表示 */
+.project-folder-row-wrap[data-ai-state="running"]:not(:has(.project-folder-row.selected)) {
+  background: #f7ecc3;
+  animation: ai-row-pulse 1.6s ease-in-out infinite;
+}
+
 .project-folder-row-wrap[data-ai-state="approval"]:not(:has(.project-folder-row.selected)) {
-  background: #fdefec;
+  background: #f9d9d5;
+  animation: ai-row-blink 0.6s ease-in-out infinite;
+}
+
+.project-folder-row-wrap[data-ai-state="done"]:not(:has(.project-folder-row.selected)) {
+  background: #dcf2e0;
 }
 
 .project-folder-row-wrap[data-ai-state="running"] .project-folder-copy span {
@@ -1053,6 +1065,18 @@ svg {
 @keyframes ai-status-blink {
   50% {
     opacity: 0.1;
+  }
+}
+
+@keyframes ai-row-pulse {
+  50% {
+    background-color: #fdf7e3;
+  }
+}
+
+@keyframes ai-row-blink {
+  50% {
+    background-color: #fdeeeb;
   }
 }
 

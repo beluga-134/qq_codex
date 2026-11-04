@@ -10,3 +10,6 @@ src-tauri/gen/
 *.json.tmp
 project-folders.json
 tests/ai-status/out/
+formal.exe
+formal*.exe
+.pi/

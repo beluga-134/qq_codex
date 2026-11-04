@@ -2142,7 +2142,10 @@ type TerminalPaneAiState = "idle" | "running" | "approval" | "done";
 // 扫描 PTY 输出中的 TUI 提示文字推断 AI 状态，映射到左侧项目文件夹行：
 //   running  = AI 正在工作（codex / Claude Code / pi 运行时都显示 "esc to interrupt"）
 //   approval = 等待审批（codex / Claude Code 的审批选项文案；
-//               pi 的自定义 permission 扩展审批对话框：“批准执行？/总是允许这条命令/审批原因:”）
+//               pi permissions.ts 命令审批：“是否批准执行这条命令？/允许执行/总是允许这条命令”；
+//               pi sandbox 四种审批：提权审批、提权重跑审批、网络访问审批（批量）、
+//               网络审批运行时单域名兑底——标题词 + 常驻状态行“🔒 权限/提权重跑/网络 审批请求:”，
+//               状态行在弹窗期间常驻重绘、选择后清除，不会残留误报）
 //   done     = 完成（codex 显式 "tokens used"；其余靠“运行标记消失 + 输出静默”启发式）
 // 匹配失败时静默降级为不显示，不影响终端。要支持新的 CLI，往对应数组加正则即可。
 const AI_ACTIVITY_PATTERNS: Record<Exclude<TerminalPaneAiState, "idle">, RegExp[]> = {
@@ -2161,6 +2164,15 @@ const AI_ACTIVITY_PATTERNS: Record<Exclude<TerminalPaneAiState, "idle">, RegExp[
     /批准执行/gu,
     /总是允许这条命令/gu,
     /审批原因[:：]/gu,
+    // pi sandbox 提权审批 / 提权重跑审批（标题 + 常驻状态行）；
+    // 网络审批请求状态行排除“0 个域名”清零形态，但覆盖单域名兑底（host 非数字）
+    /提权(重跑)?审批/gu,
+    /🔒\s*(权限|提权重跑)审批请求/gu,
+    /🔒\s*网络审批请求[:：]\s*(?!0\s*个)\S/gu,
+    // pi sandbox 网络访问审批（批量 / 运行时单域名兑底）
+    /网络访问审批/gu,
+    /未放行域名/gu,
+    /写入 \.pi\/sandbox\.json/gu,
   ],
   done: [
     /\btokens used\b/gi,

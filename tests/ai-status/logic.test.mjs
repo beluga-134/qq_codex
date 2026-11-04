@@ -107,6 +107,18 @@ await test("审批文案 → approval（codex / Claude Code / pi permission 扩�
     "批准执行？ git push — origin main",
     "❯ 允许执行   总是允许这条命令   阻止",
     "⚠ 审批原因: 破坏性命令 rm",
+    // pi 沙箱网络审批弹窗（Sandbox 网络访问审批·批量，域名白名单）与底部常驻状态行
+    "Sandbox 网络访问审批 · 批量\n本命令将访问 1 个未放行域名: www.baidu.com",
+    "❯ 全部允许（本会话）   全部总是允许（写入 .pi/sandbox.json）   阻止全部（本会话）",
+    "🔒 网络审批请求：1 个域名",
+    // pi sandbox 网络审批（真实文案：全角括号“（批量）”+ 运行时单域名兑底，host 非数字）
+    "🔒 网络审批请求: 3 个域名\nSandbox 网络访问审批（批量）\n本命令将访问以下未放行域名（共 3 个）:\n  · www.baidu.com",
+    "🔒 网络审批请求: www.baidu.com:443\nSandbox 网络访问审批（运行时发现）\n命令请求访问未放行域名: www.baidu.com:443\n❯ 允许（本会话）   总是允许（写入 .pi/sandbox.json）   阻止（本会话内不再询问）",
+    // pi sandbox 提权审批（sudo/.exe/tmux 等沙箱外能力）与提权重跑审批（错误钩子兑底）
+    "🔒 权限审批请求: sudo\nSandbox 提权审批\n以下命令需要沙箱外的系统能力: sudo\n❯ 允许（仅此命令）  本会话允许此类  总是允许此类（写入 .pi/sandbox.json）  沙箱内执行（可能失败）",
+    "🔒 提权重跑审批请求: .exe\nSandbox 提权重跑审批\n命令在沙箱内失败: .exe\n批准后将在沙箱外重跑该命令。",
+    // pi permissions.ts 完整弹窗形态（前置中文说明 + “是否批准执行这条命令？”）
+    "🛡️ 审批目的：当前为级别 1·ask——除只读命令外所有命令都要先经你批准才会执行\n\n是否批准执行这条命令？\n❯ 允许执行  总是允许这条命令  阻止",
   ];
   for (const tail of tails) assert.equal(sandbox.paneAiMarkerState({ aiTail: tail }), "approval", tail);
 });
@@ -117,6 +129,12 @@ await test("pi 常驻状态栏与 /permissions status 不误报 approval", () =>
     "已记住这条命令，之后自动放行（/permissions status 可查看）", // 批准后的 notify
     "已阻止: rm -rf /tmp/x", // 拒绝后的 notify，非等待审批
     "用法: /permissions trust <目录>",
+    "🔒 网络审批请求：0 个域名", // 网络审批批准/阻止后计数清零，不再等待
+    "Sandbox: 本会话内「sudo」类命令免审批", // sandbox 提权批准后的 notify
+    "Sandbox: 已持久化「sudo」免审批", // sandbox 写入配置成功后的 notify
+    "Sandbox: 已阻止 2 个域名（本会话）", // sandbox 阻止后的 notify
+    "🔒 Sandbox: 3 domains, 5 write paths", // sandbox 启动常驻状态行
+    "提权命令（sandbox-full/sudo 前缀）→ bg_run 不适用，按原样执行走审批链", // bg_run 帮助文本
   ];
   for (const tail of tails) assert.notEqual(sandbox.paneAiMarkerState({ aiTail: tail }), "approval", tail);
 });

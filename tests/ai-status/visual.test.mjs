@@ -165,33 +165,38 @@ await test("idle：无状态条、角标隐藏、显示路径", async () => {
   assert.equal(await styleOf(barSel("p-idle") + " .project-folder-icon", "::after", "opacity"), "0");
   assert.equal(await page.textContent("[data-project-id=\"p-idle\"] .project-folder-copy span"), UNC_QQ);
 });
-await test("running：黄条 #e0ad26 + 脉冲动画 + 黄角标 + 状态文字", async () => {
+await test("running：黄条 #e0ad26 + 脉冲动画 + 黄角标 + 整行黄底呼吸 + 状态文字", async () => {
   assert.equal(await styleOf(barSel("p-running"), "::before", "backgroundColor"), rgb(224, 173, 38));
   assert.equal(await styleOf(barSel("p-running"), "::before", "animationName"), "ai-status-pulse");
   assert.equal(await styleOf(barSel("p-running"), "::before", "animationDuration"), "1.2s");
   assert.equal(await styleOf(barSel("p-running") + " .project-folder-icon", "::after", "backgroundColor"), rgb(224, 173, 38));
   assert.equal(await styleOf(barSel("p-running") + " .project-folder-icon", "::after", "opacity"), "1");
+  assert.equal(await styleOf(barSel("p-running"), "", "animationName"), "ai-row-pulse");
+  assert.equal(await styleOf(barSel("p-running"), "", "animationDuration"), "1.6s");
   assert.equal(await page.textContent("[data-project-id=\"p-running\"] .project-folder-copy span"), "AI 正在工作…");
   assert.equal(await styleOf(barSel("p-running") + " .project-folder-copy span", "", "color"), rgb(139, 108, 18));
   assert.equal(await styleOf(barSel("p-running") + " .project-folder-copy span", "", "fontWeight"), "700");
 });
-await test("approval：红条 #d8493f + 0.6s steps 闪烁 + 红角标 + 行底色 #fdefec", async () => {
+await test("approval：红条 #d8493f + 0.6s steps 闪烁 + 红角标 + 整行红底闪烁", async () => {
   assert.equal(await styleOf(barSel("p-approval"), "::before", "backgroundColor"), rgb(216, 73, 63));
   assert.equal(await styleOf(barSel("p-approval"), "::before", "animationName"), "ai-status-blink");
   assert.equal(await styleOf(barSel("p-approval"), "::before", "animationDuration"), "0.6s");
   assert.equal(await styleOf(barSel("p-approval") + " .project-folder-icon", "::after", "backgroundColor"), rgb(216, 73, 63));
-  assert.equal(await styleOf(barSel("p-approval"), "", "backgroundColor"), rgb(253, 239, 236));
+  assert.equal(await styleOf(barSel("p-approval"), "", "animationName"), "ai-row-blink");
+  assert.equal(await styleOf(barSel("p-approval"), "", "animationDuration"), "0.6s");
   assert.equal(await page.textContent("[data-project-id=\"p-approval\"] .project-folder-copy span"), "等待审批…");
   assert.equal(await styleOf(barSel("p-approval") + " .project-folder-copy span", "", "color"), rgb(163, 34, 24));
 });
-await test("approval + 选中：保持选中蓝底，不加红色行底色", async () => {
-  assert.equal(await styleOf(barSel("p-approval-sel"), "", "backgroundColor"), rgb(255, 255, 255));
+await test("approval + 选中：保持选中蓝底，不加红色整行底色", async () => {
+  assert.equal(await styleOf(barSel("p-approval-sel"), "", "animationName"), "none");
   assert.equal(await styleOf(barSel("p-approval-sel") + " .project-folder-row", "", "backgroundColor"), "rgb(49, 106, 197)");
 });
-await test("done：绿条 #28b04a 常亮无动画 + 绿角标 + 绿色文字", async () => {
+await test("done：绿条 #28b04a 常亮无动画 + 绿角标 + 整行绿底 #dcf2e0 + 绿色文字", async () => {
   assert.equal(await styleOf(barSel("p-done"), "::before", "backgroundColor"), rgb(40, 176, 74));
   assert.equal(await styleOf(barSel("p-done"), "::before", "animationName"), "none");
   assert.equal(await styleOf(barSel("p-done") + " .project-folder-icon", "::after", "backgroundColor"), rgb(40, 176, 74));
+  assert.equal(await styleOf(barSel("p-done"), "", "backgroundColor"), rgb(220, 242, 224));
+  assert.equal(await styleOf(barSel("p-done"), "", "animationName"), "none");
   assert.equal(await page.textContent("[data-project-id=\"p-done\"] .project-folder-copy span"), "已完成");
   assert.equal(await styleOf(barSel("p-done") + " .project-folder-copy span", "", "color"), rgb(23, 107, 53));
 });
@@ -232,6 +237,38 @@ await test("approval 红条 opacity 以 steps 在 1 ↔ 0.1 间跳变", async ()
 await test("done 绿条 opacity 恒为 1（常亮）", async () => {
   const s = await sampleOpacity("p-done", 1200);
   assert.ok(s.every((v) => v === 1), `应恒为 1，实测 ${[...new Set(s)].join(",")}`);
+});
+
+async function sampleWrapBg(id, durationMs, stepMs = 60) {
+  return page.evaluate(async ([sel, duration, step]) => {
+    const el = document.querySelector(sel);
+    const samples = [];
+    const start = performance.now();
+    while (performance.now() - start < duration) {
+      const m = getComputedStyle(el).backgroundColor.match(/\d+/g);
+      samples.push(m.map(Number));
+      await new Promise((r) => setTimeout(r, step));
+    }
+    return samples;
+  }, [barSel(id), durationMs, stepMs]);
+}
+await test("running 整行底色 #f7ecc3 ↔ #fdf7e3 呼吸", async () => {
+  const s = await sampleWrapBg("p-running", 2600);
+  const blues = s.map((c) => c[2]); // 蓝通道 195↔227 差异最大
+  assert.ok(Math.max(...blues) >= 220, `峰值蓝通道应≈227，实测 ${Math.max(...blues)}`);
+  assert.ok(Math.min(...blues) <= 202, `谷值蓝通道应≈195，实测 ${Math.min(...blues)}`);
+});
+await test("approval 整行底色 #f9d9d5 ↔ #fdeeeb 闪烁", async () => {
+  const s = await sampleWrapBg("p-approval", 1800);
+  const greens = s.map((c) => c[1]); // 绿通道 213↔238 差异最大
+  assert.ok(Math.max(...greens) >= 231, `亮相绿通道应≈238，实测 ${Math.max(...greens)}`);
+  assert.ok(Math.min(...greens) <= 220, `暗相绿通道应≈213，实测 ${Math.min(...greens)}`);
+});
+await test("done 整行底色 #dcf2e0 常亮不变", async () => {
+  const s = await sampleWrapBg("p-done", 1200);
+  const uniq = [...new Set(s.map((c) => c.join(",")))];
+  assert.equal(uniq.length, 1, `应恒为 #dcf2e0，实测 ${uniq.join(" | ")}`);
+  assert.deepEqual(s[0], [220, 242, 224]);
 });
 
 console.log("\n[3] 准端到端：注入真实检测代码，模拟 codex ANSI 输出流");
@@ -294,7 +331,7 @@ await test("codex 审批提示 → approval（红条 + 行底色）", async () =
   assert.equal(s.copy, "等待审批…");
   assert.equal(s.beforeColor, "rgb(216, 73, 63)");
   const bg = await styleOf(barSel("live"), "", "backgroundColor");
-  assert.equal(bg, "rgb(253, 239, 236)");
+  assert.equal(bg, "rgb(249, 217, 213)");
   await page.locator('[data-project-id="live"]').screenshot({ path: join(outDir, "live-2-approval.png") });
 });
 await test("用户批准后继续 → running", async () => {
@@ -384,7 +421,7 @@ await test("permission 扩展弹审批（批准执行？/审批原因:）→ app
   assert.equal(s.aiState, "approval");
   assert.equal(s.copy, "等待审批…");
   assert.equal(s.barColor, "rgb(216, 73, 63)");
-  assert.equal(s.rowBg, "rgb(253, 239, 236)");
+  assert.equal(s.rowBg, "rgb(249, 217, 213)");
   await page.locator('[data-project-id="live-pi"]').screenshot({ path: join(outDir, "pi-2-approval.png") });
 });
 await test("选择“允许执行”后恢复 running；/permissions status 仍不误报", async () => {
@@ -393,6 +430,45 @@ await test("选择“允许执行”后恢复 running；/permissions status 仍�
   await feedPi("当前审批级别: 1 · ask（除只读命令外）\r\n总是允许的命令 0 条\r\n");
   assert.equal((await piState()).aiState, "running", "status 输出不应改变状态");
   await page.locator('[data-project-id="live-pi"]').screenshot({ path: join(outDir, "pi-3-resumed.png") });
+});
+await test("沙箱网络审批弹窗（网络访问审批/未放行域名）→ approval 红条 + 行底色", async () => {
+  await feedPi(
+    "╭─ \u001b[1m\u001b[36mSandbox 网络访问审批 · 批量\u001b[0m ─────────╮\r\n" +
+    "│ 本命令将访问 1 个未放行域名: \u001b[33mwww.baidu.com\u001b[0m │\r\n" +
+    "│ ❯ 全部允许（本会话）   全部总是允许（写入 .pi/sandbox.json）   阻止全部 │\r\n" +
+    "╰──────────────────────────╯\r\n",
+  );
+  const s = await piState();
+  assert.equal(s.aiState, "approval");
+  assert.equal(s.copy, "等待审批…");
+  assert.equal(s.barColor, "rgb(216, 73, 63)");
+  assert.equal(s.rowBg, "rgb(249, 217, 213)");
+  await page.locator('[data-project-id="live-pi"]').screenshot({ path: join(outDir, "pi-4-net-approval.png") });
+});
+await test("网络审批批准后：请求计数清零不误报，恢复 running", async () => {
+  await feedPi("\u001b[2K✔ 已全部允许（本会话） ⠸ Working… (escape to interrupt)\u001b[0m\r\n");
+  assert.equal((await piState()).aiState, "running");
+  await feedPi("🔒 网络审批请求：0 个域名\r\n");
+  assert.equal((await piState()).aiState, "running", "计数清零后不应回到 approval");
+});
+await test("提权审批弹窗（Sandbox 提权审批/允许（仅此命令））→ approval 红条 + 行底色", async () => {
+  await feedPi(
+    "🔒 权限审批请求: sudo\r\n" +
+    "╭─ \u001b[1m\u001b[36mSandbox 提权审批\u001b[0m ─────────╮\r\n" +
+    "│ 以下命令需要沙箱外的系统能力: sudo │\r\n" +
+    "│ ❯ 允许（仅此命令）  本会话允许此类  总是允许此类（写入 .pi/sandbox.json）  沙箱内执行（可能失败） │\r\n" +
+    "╰──────────────────────────╯\r\n",
+  );
+  const s = await piState();
+  assert.equal(s.aiState, "approval");
+  assert.equal(s.copy, "等待审批…");
+  assert.equal(s.barColor, "rgb(216, 73, 63)");
+  assert.equal(s.rowBg, "rgb(249, 217, 213)");
+  await page.locator('[data-project-id="live-pi"]').screenshot({ path: join(outDir, "pi-5-priv-approval.png") });
+});
+await test("提权批准后：免审批 notify 不误报，恢复 running", async () => {
+  await feedPi("\u001b[2K✔ Sandbox: 本会话内「sudo」类命令免审批 ⠸ Working… (escape to interrupt)\u001b[0m\r\n");
+  assert.equal((await piState()).aiState, "running", "批准后的 notify 不应触发 approval");
 });
 
 await browser.close();
