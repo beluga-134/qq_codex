@@ -673,6 +673,16 @@ export const backend = {
     return invoke<string>("open_terminal_file", { path });
   },
 
+  /** 读取全部便签（exe 同目录 notes.json；联系人 id → 文本） */
+  async readNotes(): Promise<Record<string, string>> {
+    return invoke<Record<string, string>>("read_notes");
+  },
+
+  /** 全量写回便签（原子替换） */
+  async writeNotes(notes: Record<string, string>): Promise<void> {
+    return invoke<void>("write_notes", { notes });
+  },
+
   async resizePty(sessionId: number, rows: number, cols: number): Promise<void> {
     if (!isTauri()) return;
     return invoke<void>("pty_resize", {

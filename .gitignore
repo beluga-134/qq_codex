@@ -13,3 +13,4 @@ tests/ai-status/out/
 formal.exe
 formal*.exe
 .pi/
+notes.json

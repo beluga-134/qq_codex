@@ -2,6 +2,7 @@
 //! 主题模块见同目录文件；本文件只保留模块声明与 run()。
 
 mod chat;
+mod notes;
 mod projects;
 mod pty;
 mod terminal_exec;
@@ -17,6 +18,7 @@ use projects::{
     project_store_path, read_project_store, spawn_project_store_watcher, write_project_store,
 };
 use std::sync::Mutex;
+use notes::{read_notes, write_notes};
 use pty::{pty_close, pty_open, pty_resize, pty_write, PtyState};
 use terminal_files::{
     export_terminal_image, open_terminal_file, read_terminal_image, save_terminal_image,
@@ -77,6 +79,8 @@ pub fn run() {
             stat_terminal_image,
             export_terminal_image,
             open_terminal_file,
+            read_notes,
+            write_notes,
             mark_read,
             set_presence
         ])
