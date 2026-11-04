@@ -1048,7 +1048,7 @@ class PtyImageExtractor {
   private payloadLeft = 0;
   private seq = 0;
   private lastMarker: string | null = null;
-  private readonly decorator: ImagePathDecorator;
+  private readonly textDecoder = new TextDecoder();
 
   private static readonly FULL_HEAD = [
     0x1b, 0x5d, 0x31, 0x33, 0x33, 0x37, 0x3b, 0x46, 0x69, 0x6c, 0x65, 0x3d,
@@ -1059,16 +1059,14 @@ class PtyImageExtractor {
   constructor(
     private readonly ownerId: number,
     private readonly onImage: (bytes: Uint8Array, path: string) => void,
-    onText: (text: string) => void,
-  ) {
-    this.decorator = new ImagePathDecorator(onText);
-  }
+    private readonly onText: (text: string) => void,
+  ) {}
 
   write(data: Uint8Array): void {
     let plain: number[] = [];
     const flush = () => {
       if (plain.length > 0) {
-        this.decorator.push(Uint8Array.from(plain));
+        this.onText(this.textDecoder.decode(Uint8Array.from(plain), { stream: true }));
         plain = [];
       }
     };
@@ -1205,9 +1203,7 @@ class PtyImageExtractor {
     flush();
   }
 
-  dispose(): void {
-    this.decorator.dispose();
-  }
+  dispose(): void {}
 
   private tailTo(plain: number[]): void {
     plain.push(...this.tail);
@@ -1243,7 +1239,6 @@ class PtyImageExtractor {
       for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
       this.seq += 1;
       const path = `/tmp/qq-img-${this.ownerId}-${this.seq}.${sniffImageExtension(bytes)}`;
-      // 提示语由 ImagePathDecorator 统一追加（对一切识别到的图片路径生效）
       this.lastMarker = `\x1b[36m${path}\x1b[0m`;
       this.onImage(bytes, path);
     } catch {
@@ -1259,97 +1254,6 @@ let hoverPreviewPath = "";
 /** 终端里可悬浮预览的图片路径（POSIX 绝对路径 / Windows 盘符 / UNC） */
 const IMAGE_PATH_REGEX =
   /(?:\\\\[^\s"'<>|]+|[A-Za-z]:\\[^\s"'<>|]+|\/[^\s"'<>|]+)\.(?:png|jpe?g|gif|webp|bmp)/gi;
-/** 图片路径后追加的深绿色括号提示 */
-const IMAGE_HINT_ANSI = "\x1b[32m（鼠标悬浮预览，点击查看大图/保存）\x1b[0m";
-/** 不会出现在路径字符集里的字符（视为路径边界） */
-const IMAGE_PATH_BOUNDARY = /[\s"'<>|]/;
-
-function decorateImagePaths(text: string): string {
-  IMAGE_PATH_REGEX.lastIndex = 0;
-  return text.replace(IMAGE_PATH_REGEX, (match) =>
-    match.includes("://") ? match : match + IMAGE_HINT_ANSI,
-  );
-}
-
-/** 纯文本流装饰器：在完整识别出的图片路径后追加绿色提示。
- * 路径可能跨 PTY chunk 分裂：末尾可能仍在生长的“路径尾巴”暂存不吐，
- * 待边界字符（空白/引号等）确认后一并装饰输出；≤8 字节的小 chunk 视为
- * 交互键入，立即原样透出（避免键入回显被扣住不显示），也不装饰。 */
-class ImagePathDecorator {
-  private buf = "";
-  private timer: number | null = null;
-  private readonly decoder = new TextDecoder();
-
-  constructor(
-    private readonly emit: (text: string) => void,
-    private readonly timeoutMs = 60,
-  ) {}
-
-  push(chunk: Uint8Array): void {
-    if (chunk.length === 0) return;
-    this.cancelTimer();
-    if (chunk.length <= 8) {
-      this.flushRaw();
-      this.emit(this.decoder.decode(chunk, { stream: true }));
-      return;
-    }
-    this.buf += this.decoder.decode(chunk, { stream: true });
-    this.commit();
-    if (this.buf.length > 0) {
-      // 超时兑底：流停止时把残留尾巴原样吐出，避免末尾文本永远不显示
-      this.timer = window.setTimeout(() => {
-        this.timer = null;
-        this.flushRaw();
-      }, this.timeoutMs);
-    }
-  }
-
-  dispose(): void {
-    this.cancelTimer();
-    this.buf = "";
-  }
-
-  private cancelTimer(): void {
-    if (this.timer !== null) {
-      window.clearTimeout(this.timer);
-      this.timer = null;
-    }
-  }
-
-  private flushRaw(): void {
-    if (this.buf.length === 0) return;
-    const rest = this.buf;
-    this.buf = "";
-    this.emit(rest);
-  }
-
-  private commit(): void {
-    if (this.buf.length === 0) return;
-    let lastBoundary = -1;
-    for (let i = this.buf.length - 1; i >= 0; i -= 1) {
-      if (IMAGE_PATH_BOUNDARY.test(this.buf[i])) {
-        lastBoundary = i;
-        break;
-      }
-    }
-    const tail = this.buf.slice(lastBoundary + 1);
-    // 只有尾巴还可能长成图片路径时才暂存（含 / 或 \，或是潜在盘符前缀）
-    const holdable = tail.length <= 1024
-      && (tail.includes("/") || tail.includes("\\") || /^[A-Za-z]?:?$/.test(tail));
-    if (!holdable) {
-      this.flushDecorated(this.buf);
-      return;
-    }
-    if (lastBoundary >= 0) this.flushDecorated(this.buf.slice(0, lastBoundary + 1));
-    this.buf = tail;
-  }
-
-  private flushDecorated(text: string): void {
-    this.buf = this.buf.slice(text.length);
-    this.emit(decorateImagePaths(text));
-  }
-}
-
 /** 路径 → data: URL 缓存：带 mtime/size 失效判定，同名文件重绘后悬浮自动刷新 */
 interface CachedTerminalImage {
   url: string;
@@ -2393,7 +2297,7 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
     id,
     (bytes, path) => persistTerminalImage(pane, bytes, path),
     (text) => {
-      // 装饰器可能异步（起时器）吐出残留尾巴：写入前确认窗格仍存活
+      // 输出前确认窗格仍存活（会话关闭后不再写入）
       if (pane.disposed || pane.workspace.panes.get(pane.id) !== pane) return;
       pane.terminal.write(text);
     },
