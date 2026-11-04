@@ -944,6 +944,82 @@ fn project_folder_resolution(resolved: ResolvedProjectFolder) -> ProjectFolderRe
     }
 }
 
+// ============================================================
+// 文件夹打开器配置（open-with.json，exe 同目录，便携迁移）
+// ============================================================
+
+const FOLDER_OPENER_CONFIG_FILE: &str = "open-with.json";
+
+/// `open-with.json` 的 `openFolderWith` 节；文件缺失/损坏/缺节时静默回落 OneCommander
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderOpener {
+    /// 打开器 exe 路径；相对路径相对本 exe 所在目录解析（便携迁移）
+    exe: String,
+    /// 参数模板，`{path}` 占位符替换为项目 Windows 路径；缺省为 ["{path}"]
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct FolderOpenerConfig {
+    #[serde(default)]
+    open_folder_with: Option<FolderOpener>,
+}
+
+fn folder_opener_config_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.parent().map(|dir| dir.join(FOLDER_OPENER_CONFIG_FILE))
+}
+
+/// 读 exe 同目录 open-with.json；任何失败（缺文件/坏 JSON/缺节）都返回 None → 走 OneCommander
+fn load_folder_opener() -> Option<FolderOpener> {
+    let path = folder_opener_config_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let config: FolderOpenerConfig = serde_json::from_str(raw.trim_start_matches('\u{FEFF}')).ok()?;
+    config.open_folder_with
+}
+
+/// 用配置的打开器启动项目文件夹；配置是用户显式写的，失败必须报错可见
+#[cfg(target_os = "windows")]
+fn launch_folder_opener(opener: &FolderOpener, project_path: &str) -> Result<(), String> {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let exe_path = Path::new(&opener.exe);
+    let resolved = if exe_path.is_absolute() {
+        exe_path.to_path_buf()
+    } else {
+        match base {
+            Some(dir) => dir.join(exe_path),
+            None => exe_path.to_path_buf(),
+        }
+    };
+    if !resolved.is_file() {
+        return Err(format!(
+            "open-with.json 配置的打开器不存在：{}（解析为 {}）",
+            opener.exe,
+            resolved.display()
+        ));
+    }
+    let args: Vec<String> = if opener.args.is_empty() {
+        vec![project_path.to_string()]
+    } else {
+        opener
+            .args
+            .iter()
+            .map(|arg| arg.replace("{path}", project_path))
+            .collect()
+    };
+    let mut command = Command::new(&resolved);
+    command.args(&args);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法启动 {}：{error}", resolved.display()))
+}
+
 fn onecommander_candidate_paths(
     configured_executable: Option<&Path>,
     program_files_roots: &[PathBuf],
@@ -1828,6 +1904,10 @@ fn open_project_folder_in_onecommander(
     {
         let project_path =
             onecommander_project_path(&path, wsl_distribution.as_deref(), wsl_path_to_windows)?;
+        // open-with.json 配置的打开器优先（exe 同目录便携配置）；未配置时回落 OneCommander
+        if let Some(opener) = load_folder_opener() {
+            return launch_folder_opener(&opener, &project_path);
+        }
         return launch_onecommander(&project_path);
     }
 
