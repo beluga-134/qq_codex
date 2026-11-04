@@ -667,6 +667,12 @@ export const backend = {
     return invoke<string>("export_terminal_image", { path });
   },
 
+  /** 用系统默认程序打开终端里输出的文件路径，返回实际打开的宿主路径 */
+  async openTerminalFile(path: string): Promise<string> {
+    if (!isTauri()) throw new Error("仅桌面版支持打开文件");
+    return invoke<string>("open_terminal_file", { path });
+  },
+
   async resizePty(sessionId: number, rows: number, cols: number): Promise<void> {
     if (!isTauri()) return;
     return invoke<void>("pty_resize", {

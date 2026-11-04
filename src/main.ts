@@ -1254,6 +1254,11 @@ let hoverPreviewPath = "";
 /** 终端里可悬浮预览的图片路径（POSIX 绝对路径 / Windows 盘符 / UNC） */
 const IMAGE_PATH_REGEX =
   /(?:\\\\[^\s"'<>|]+|[A-Za-z]:\\[^\s"'<>|]+|\/[^\s"'<>|]+)\.(?:png|jpe?g|gif|webp|bmp)/gi;
+/** 终端里可点击用系统默认程序打开的文件路径（任意类型）：绝对路径 + 扩展名结尾；
+ * 排除图片（图片走悬浮预览/大图）；扩展名后须是空白/行尾，避免路径中
+ * 间目录带点（/a/b.c/d）或 yml:3:5 位置后缀被截成半截路径 */
+const FILE_PATH_REGEX =
+  /(?:\\[^\s"'<>|]+|[A-Za-z]:\\[^\s"'<>|]+|\/[^\s"'<>|]+)\.(?!png|jpe?g|gif|webp|bmp)[A-Za-z0-9]{1,8}(?=[\s]|$)/gi;
 /** 路径 → data: URL 缓存：带 mtime/size 失效判定，同名文件重绘后悬浮自动刷新 */
 interface CachedTerminalImage {
   url: string;
@@ -1338,6 +1343,16 @@ async function saveTerminalImageAs(path: string): Promise<void> {
     showToast(`已保存：${target}`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : "保存图片失败");
+  }
+}
+
+/** 点击文件路径：用系统默认程序打开（图片以外的任意文件） */
+async function openTerminalFile(path: string): Promise<void> {
+  try {
+    const target = await backend.openTerminalFile(path);
+    showToast(`已打开：${target}`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "打开文件失败");
   }
 }
 
@@ -2311,13 +2326,15 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
           const lineBuffer = terminal.buffer.active.getLine(line - 1);
           if (!lineBuffer) return callback(undefined);
           const text = lineBuffer.translateToString(true);
-          IMAGE_PATH_REGEX.lastIndex = 0;
           const links: XtermImageLink[] = [];
           const seen = new Set<string>();
+          // URL（https://x/a.md）的路径段不识别：匹配起点左侧是 “:” 或以 “://” 结尾
+          const isUrlBody = (index: number) =>
+            index > 0 && (text[index - 1] === ":" || text.slice(0, index).endsWith("://"));
           for (const match of text.matchAll(IMAGE_PATH_REGEX)) {
             const path = match[0];
             const column = match.index ?? -1;
-            if (column < 0 || seen.has(path) || path.includes("://")) continue;
+            if (column < 0 || seen.has(path) || isUrlBody(column)) continue;
             seen.add(path);
             links.push({
               range: {
@@ -2328,6 +2345,23 @@ function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
               activate: () => void openPinnedImagePanel(path),
               hover: (hoverEvent) => void previewTerminalImage(path, hoverEvent),
               leave: () => hideHoverPreview(),
+            });
+          }
+          // 任意文件路径：点击用系统默认程序打开（悬浮保持安静，xterm 自带下划线高亮）
+          for (const match of text.matchAll(FILE_PATH_REGEX)) {
+            const path = match[0];
+            const column = match.index ?? -1;
+            if (column < 0 || seen.has(path) || isUrlBody(column)) continue;
+            seen.add(path);
+            links.push({
+              range: {
+                start: { x: column + 1, y: line },
+                end: { x: column + 1 + path.length, y: line },
+              },
+              text: path,
+              activate: () => void openTerminalFile(path),
+              hover: () => {},
+              leave: () => {},
             });
           }
           callback(links.length > 0 ? (links as never) : undefined);
