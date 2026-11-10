@@ -7,3 +7,14 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 *.log
+*.json.tmp
+project-folders.json
+tests/ai-status/out/
+formal.exe
+formal*.exe
+.pi/
+notes.json
+open-with.json
+logs/
+resume.json
+click-test.txt

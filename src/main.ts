@@ -1,59 +1,11 @@
-import {
-  ArrowLeft,
-  Bell,
-  Bold,
-  ChevronDown,
-  Clock3,
-  Columns2,
-  createIcons,
-  Eraser,
-  FileUp,
-  Folder,
-  FolderOpen,
-  History,
-  Image,
-  Italic,
-  MailPlus,
-  Maximize2,
-  MessageSquare,
-  Minus,
-  Minimize2,
-  MoreHorizontal,
-  Palette,
-  Paperclip,
-  Pencil,
-  Phone,
-  Plus,
-  RefreshCw,
-  Rows2,
-  Search,
-  Send,
-  Settings,
-  Smile,
-  Terminal as TerminalIcon,
-  Underline,
-  UserPlus,
-  Users,
-  Video,
-  Volume2,
-  VolumeX,
-  X,
-  Zap,
-  ZoomIn,
-  ZoomOut,
-} from "lucide";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Terminal as XtermTerminal, type IDisposable } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
 
 import "./styles.css";
 import "@xterm/xterm/css/xterm.css";
-import { backend, type PtyExit } from "./backend";
+import { backend, type ProjectStore } from "./backend";
 import {
-  PROJECT_CONTACT_PREFIX,
-  TERMINAL_CONTACT_ID,
-  type AppSnapshot,
   type Contact,
   type Message,
   type Presence,
@@ -69,6 +21,29 @@ import mayuAvatar from "./assets/avatars/mayu.png";
 import serviceAvatar from "./assets/avatars/service.png";
 import oldfriendAvatar from "./assets/avatars/oldfriend.png";
 import terminalAvatar from "./assets/avatars/terminal.png";
+
+import { icon, query, refreshIcons, showToast } from "./ui";
+import { state, isTauriRuntime, isProjectContact, isTerminalContact, projectContactId, projectIdFromContactId } from "./state";
+import {
+  activeTerminalPane,
+  AI_ACTIVITY_STATE_TEXT,
+  handlePreviewTerminalInput,
+  openTerminalPane,
+  projectAiStates,
+  queuePanePtyWrite,
+  terminalPanePosition,
+  disposeTerminalWorkspace,
+  ensureTerminal,
+  restartTerminal,
+  scheduleTerminalFit,
+  splitActiveTerminal,
+  terminalWorkspace,
+  updateTerminalConnectionStatus,
+  setTerminalHooks,
+  type TerminalPaneRuntime,
+  type TerminalWorkspace,
+} from "./terminal";
+import { installWatchdogPing, maybeRecoverDialogs, setRecoveryHooks, startNewPiDialog } from "./recovery";
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
 if (!appRoot) throw new Error("Missing #app root");
@@ -94,50 +69,6 @@ const presenceText: Record<Presence, string> = {
   offline: "隐身",
 };
 
-const iconSet = {
-  ArrowLeft,
-  Bell,
-  Bold,
-  ChevronDown,
-  Clock3,
-  Columns2,
-  Eraser,
-  FileUp,
-  Folder,
-  FolderOpen,
-  History,
-  Image,
-  Italic,
-  MailPlus,
-  Maximize2,
-  MessageSquare,
-  Minus,
-  Minimize2,
-  MoreHorizontal,
-  Palette,
-  Paperclip,
-  Pencil,
-  Phone,
-  Plus,
-  RefreshCw,
-  Rows2,
-  Search,
-  Send,
-  Settings,
-  Smile,
-  Terminal: TerminalIcon,
-  Underline,
-  UserPlus,
-  Users,
-  Video,
-  Volume2,
-  VolumeX,
-  X,
-  Zap,
-  ZoomIn,
-  ZoomOut,
-};
-
 type RosterTab = "friends" | "groups" | "recent";
 type ResizeDirection =
   | "North"
@@ -149,53 +80,7 @@ type ResizeDirection =
   | "West"
   | "NorthWest";
 
-type TerminalSplitDirection = "left-right" | "top-bottom";
-type TerminalPaneState = "opening" | "connected" | "exited" | "error";
-type TerminalLayoutNode =
-  | { kind: "pane"; paneId: number }
-  | {
-      kind: "split";
-      direction: TerminalSplitDirection;
-      ratio: number;
-      first: TerminalLayoutNode;
-      second: TerminalLayoutNode;
-    };
 
-interface TerminalPaneRuntime {
-  workspace: TerminalWorkspace;
-  id: number;
-  element: HTMLElement;
-  surface: HTMLElement;
-  title: HTMLElement;
-  closeButton: HTMLButtonElement;
-  terminal: XtermTerminal;
-  fit: FitAddon;
-  resizeObserver: ResizeObserver | null;
-  sessionId: number | null;
-  openPromise: Promise<void> | null;
-  lifecycleQueue: Promise<void>;
-  writeQueue: Promise<void>;
-  resizeQueue: Promise<void>;
-  resizeTimer: number | null;
-  lineBuffer: string;
-  generation: number;
-  state: TerminalPaneState;
-  mounted: boolean;
-  disposed: boolean;
-  disposables: IDisposable[];
-}
-
-interface TerminalWorkspace {
-  contactId: string;
-  projectFolder: ProjectFolder | null;
-  layout: TerminalLayoutNode | null;
-  activePaneId: number | null;
-  nextPaneId: number;
-  fitFrame: number | null;
-  panes: Map<number, TerminalPaneRuntime>;
-}
-
-let snapshot: AppSnapshot;
 let messages: Message[] = [];
 let activeTab: RosterTab = "friends";
 let filterText = "";
@@ -211,28 +96,24 @@ let renamingProjectId: string | null = null;
 let editingProjectDirectoryId: string | null = null;
 let pendingProjectDirectoryId: string | null = null;
 let pendingProjectRemovalId: string | null = null;
-let toastTimer: number | null = null;
 let contactSelectionSequence = 0;
 const ZOOM_STORAGE_KEY = "ociq.ui.zoom";
+const ROSTER_COLLAPSED_STORAGE_KEY = "ociq.ui.roster-collapsed";
 const AVATAR_STORAGE_KEY = "ociq.profile.avatar";
 const PROJECT_FOLDERS_STORAGE_KEY = "ociq.project-folders.v1";
 const PROJECT_DIRECTORIES_STORAGE_KEY = "ociq.project-directories.v1";
 const DEFAULT_PROJECT_DIRECTORY_ID = "default-project-directory";
 const ZOOM_LEVELS = [0.75, 0.9, 1, 1.1, 1.25, 1.5];
 let currentZoom = readStoredZoom();
+let rosterCollapsed = readStoredRosterCollapsed();
 let customAvatar = readStoredAvatar();
 let pendingAvatar: string | null = customAvatar;
 let projectDirectories = readStoredProjectDirectories();
 let projectFolders = readStoredProjectFolders();
-const terminalWorkspaces = new Map<string, TerminalWorkspace>();
-const MAX_TERMINAL_PANES = 4;
-const collapsedGroups = new Set<string>();
 const pendingReplies = new Set<string>();
+const collapsedGroups = new Set<string>();
 const messageDrafts = new Map<string, string>();
 
-function icon(name: keyof typeof iconSet, size = 16): string {
-  return `<i data-lucide="${name}" data-size="${size}" aria-hidden="true"></i>`;
-}
 
 function readStoredZoom(): number {
   try {
@@ -331,76 +212,231 @@ function normalizeProjectDirectoryName(input: string): string {
 function readStoredProjectDirectories(): ProjectDirectory[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(PROJECT_DIRECTORIES_STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(parsed)) return [defaultProjectDirectory()];
-    const ids = new Set<string>();
-    const directories = parsed.filter((value): value is ProjectDirectory => {
-      if (!value || typeof value !== "object") return false;
-      const candidate = value as Partial<ProjectDirectory>;
-      if (typeof candidate.id !== "string" || typeof candidate.name !== "string" || !candidate.id) {
-        return false;
-      }
-      try {
-        candidate.name = normalizeProjectDirectoryName(candidate.name);
-      } catch {
-        return false;
-      }
-      if (ids.has(candidate.id)) return false;
-      ids.add(candidate.id);
-      return true;
-    }).slice(0, 50);
-    return directories.length > 0 ? directories : [defaultProjectDirectory()];
+    return parseProjectDirectoriesValue(parsed);
   } catch {
     return [defaultProjectDirectory()];
   }
 }
 
+function parseProjectDirectoriesValue(value: unknown): ProjectDirectory[] {
+  if (!Array.isArray(value)) return [defaultProjectDirectory()];
+  const ids = new Set<string>();
+  const directories = value.filter((item): item is ProjectDirectory => {
+    if (!item || typeof item !== "object") return false;
+    const candidate = item as Partial<ProjectDirectory>;
+    if (typeof candidate.id !== "string" || typeof candidate.name !== "string" || !candidate.id) {
+      return false;
+    }
+    try {
+      candidate.name = normalizeProjectDirectoryName(candidate.name);
+    } catch {
+      return false;
+    }
+    if (ids.has(candidate.id)) return false;
+    ids.add(candidate.id);
+    return true;
+  }).slice(0, 50);
+  return directories.length > 0 ? directories : [defaultProjectDirectory()];
+}
+
 function saveProjectDirectories(next: ProjectDirectory[]): void {
-  localStorage.setItem(PROJECT_DIRECTORIES_STORAGE_KEY, JSON.stringify(next));
   projectDirectories = next;
+  scheduleProjectStorePersist();
 }
 
 function readStoredProjectFolders(): ProjectFolder[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(PROJECT_FOLDERS_STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(parsed)) return [];
-    const ids = new Set<string>();
-    const paths = new Set<string>();
-    return parsed.filter((value): value is ProjectFolder => {
-      if (!value || typeof value !== "object") return false;
-      const candidate = value as Partial<ProjectFolder>;
-      if (
-        typeof candidate.id !== "string" ||
-        typeof candidate.name !== "string" ||
-        typeof candidate.path !== "string" ||
-        !candidate.id ||
-        !candidate.name.trim() ||
-        /[\u0000-\u001f\u007f]/.test(candidate.name)
-      ) return false;
-      candidate.name = candidate.name.trim();
-      candidate.path = candidate.path.trim();
-      candidate.directoryId = typeof candidate.directoryId === "string"
-        && projectDirectories.some((directory) => directory.id === candidate.directoryId)
-        ? candidate.directoryId
-        : projectDirectories[0]!.id;
-      if (!isStoredProjectPath(candidate.path)) return false;
-      if (!hasProjectLaunchCache(candidate as ProjectFolder)) {
-        delete candidate.wslPath;
-        delete candidate.wslDistribution;
-      }
-      const normalizedPath = projectPathKey(candidate.path);
-      if (ids.has(candidate.id) || paths.has(normalizedPath)) return false;
-      ids.add(candidate.id);
-      paths.add(normalizedPath);
-      return true;
-    }).slice(0, 100);
+    return parseProjectFoldersValue(parsed, projectDirectories);
   } catch {
     return [];
   }
 }
 
+function parseProjectFoldersValue(value: unknown, directories: ProjectDirectory[]): ProjectFolder[] {
+  if (!Array.isArray(value)) return [];
+  const ids = new Set<string>();
+  const paths = new Set<string>();
+  return value.filter((item): item is ProjectFolder => {
+    if (!item || typeof item !== "object") return false;
+    const candidate = item as Partial<ProjectFolder>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.name !== "string" ||
+      typeof candidate.path !== "string" ||
+      !candidate.id ||
+      !candidate.name.trim() ||
+      /[\u0000-\u001f\u007f]/.test(candidate.name)
+    ) return false;
+    candidate.name = candidate.name.trim();
+    candidate.path = candidate.path.trim();
+    candidate.directoryId = typeof candidate.directoryId === "string"
+      && directories.some((directory) => directory.id === candidate.directoryId)
+      ? candidate.directoryId
+      : directories[0]!.id;
+    if (!isStoredProjectPath(candidate.path)) return false;
+    if (typeof candidate.wslPath === "string" && candidate.wslDistribution === undefined) {
+      candidate.wslDistribution = null;
+    }
+    if (!hasProjectLaunchCache(candidate as ProjectFolder)) {
+      delete candidate.wslPath;
+      delete candidate.wslDistribution;
+    }
+    const normalizedPath = projectPathKey(candidate.path);
+    if (ids.has(candidate.id) || paths.has(normalizedPath)) return false;
+    ids.add(candidate.id);
+    paths.add(normalizedPath);
+    return true;
+  }).slice(0, 100);
+}
+
 function saveProjectFolders(next: ProjectFolder[]): void {
-  localStorage.setItem(PROJECT_FOLDERS_STORAGE_KEY, JSON.stringify(next));
   projectFolders = next;
+  scheduleProjectStorePersist();
+}
+
+const PROJECT_STORE_CHANGED_EVENT = "project-store-changed";
+let projectStorePathLabel = "";
+let projectStorePersistTimer: number | null = null;
+let projectStoreFlushInFlight = false;
+let projectStoreSyncing = false;
+let projectStoreReadFailed = false;
+
+function serializeProjectStoreData(
+  directories: ProjectDirectory[],
+  folders: ProjectFolder[],
+): string {
+  return JSON.stringify({
+    directories: directories.map((directory) => ({ id: directory.id, name: directory.name })),
+    folders: folders.map((folder) => ({
+      id: folder.id,
+      directoryId: folder.directoryId,
+      name: folder.name,
+      path: folder.path,
+      ...(hasProjectLaunchCache(folder)
+        ? { wslPath: folder.wslPath, wslDistribution: folder.wslDistribution }
+        : {}),
+    })),
+  });
+}
+
+function persistProjectStoreToLocalStorage(): void {
+  localStorage.setItem(PROJECT_DIRECTORIES_STORAGE_KEY, JSON.stringify(projectDirectories));
+  localStorage.setItem(PROJECT_FOLDERS_STORAGE_KEY, JSON.stringify(projectFolders));
+}
+
+function scheduleProjectStorePersist(): void {
+  if (!isTauriRuntime()) {
+    persistProjectStoreToLocalStorage();
+    return;
+  }
+  if (projectStorePersistTimer !== null) return;
+  projectStorePersistTimer = window.setTimeout(() => {
+    projectStorePersistTimer = null;
+    void flushProjectStore();
+  }, 150);
+}
+
+async function flushProjectStore(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  projectStoreFlushInFlight = true;
+  try {
+    await backend.writeProjectStore({
+      directories: projectDirectories,
+      folders: projectFolders,
+    });
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "无法写入项目数据文件");
+  } finally {
+    projectStoreFlushInFlight = false;
+  }
+}
+
+function applyProjectStoreFile(file: ProjectStore, options: { notify?: boolean } = {}): boolean {
+  const directories = parseProjectDirectoriesValue(file.directories);
+  const folders = parseProjectFoldersValue(file.folders, directories);
+  if (
+    serializeProjectStoreData(directories, folders)
+    === serializeProjectStoreData(projectDirectories, projectFolders)
+  ) {
+    return false;
+  }
+  const previousFolderIds = new Set(projectFolders.map((folder) => folder.id));
+  projectDirectories = directories;
+  projectFolders = folders;
+  syncProjectFolderContacts();
+  for (const folderId of previousFolderIds) {
+    if (projectFolders.some((folder) => folder.id === folderId)) continue;
+    const contactId = projectContactId(folderId);
+    void disposeTerminalWorkspace(contactId);
+    messageDrafts.delete(contactId);
+  }
+  if (state.snapshot && isProjectContact() && !projectFolderForContact()) {
+    const fallback = state.snapshot.contacts.find((contact) => !isProjectContact(contact.id));
+    if (fallback) void selectContact(fallback.id);
+  }
+  renderContacts();
+  renderChatHeader();
+  if (options.notify) showToast("项目数据已随外部修改更新");
+  return true;
+}
+
+async function initProjectStore(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    projectStorePathLabel = await backend.projectStorePath();
+  } catch {
+    projectStorePathLabel = "";
+  }
+  let file: ProjectStore | null = null;
+  try {
+    file = await backend.readProjectStore();
+  } catch (error) {
+    projectStoreReadFailed = true;
+    showToast(
+      `项目数据文件无法读取（${error instanceof Error ? error.message : String(error)}），请修复后重新保存，界面会自动加载`,
+    );
+  }
+  if (file) {
+    applyProjectStoreFile(file);
+    localStorage.removeItem(PROJECT_DIRECTORIES_STORAGE_KEY);
+    localStorage.removeItem(PROJECT_FOLDERS_STORAGE_KEY);
+    return;
+  }
+  if (file === null && !projectStoreReadFailed) {
+    // 文件不存在：用当前数据（含本机旧 localStorage 数据）创建便携文件
+    try {
+      await backend.writeProjectStore({
+        directories: projectDirectories,
+        folders: projectFolders,
+      });
+    } catch (error) {
+      showToast(
+        `无法创建项目数据文件（${error instanceof Error ? error.message : String(error)}），项目改动暂未落盘`,
+      );
+    }
+  }
+}
+
+async function handleProjectStoreChange(retry = true): Promise<void> {
+  if (!isTauriRuntime() || projectStoreSyncing) return;
+  if (projectStorePersistTimer !== null || projectStoreFlushInFlight) return;
+  projectStoreSyncing = true;
+  try {
+    const file = await backend.readProjectStore();
+    if (!file) return;
+    applyProjectStoreFile(file, { notify: true });
+    localStorage.removeItem(PROJECT_DIRECTORIES_STORAGE_KEY);
+    localStorage.removeItem(PROJECT_FOLDERS_STORAGE_KEY);
+  } catch (error) {
+    if (retry) {
+      window.setTimeout(() => void handleProjectStoreChange(false), 800);
+      return;
+    }
+    showToast(`无法读取项目数据文件：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    projectStoreSyncing = false;
+  }
 }
 
 function createProjectFolderId(): string {
@@ -434,7 +470,7 @@ appRoot.innerHTML = `
     </nav>
 
     <div class="workspace">
-      <aside class="roster-pane" aria-label="好友列表">
+      <aside class="roster-pane" id="roster-pane" aria-label="好友列表">
         <section class="self-profile">
           <button class="self-avatar-button" id="self-avatar-button" type="button" title="更换头像" aria-label="更换头像">
             <span class="avatar-frame avatar-large">
@@ -482,6 +518,7 @@ appRoot.innerHTML = `
       </aside>
 
       <div class="workspace-splitter" aria-hidden="true"></div>
+      <button class="roster-collapse-toggle" id="roster-collapse-toggle" type="button" aria-expanded="true" aria-controls="roster-pane" title="收起好友列表 (Ctrl+B)" aria-label="收起好友列表">${icon("ChevronsLeft", 13)}</button>
 
       <section class="chat-pane" aria-label="聊天窗口">
         <header class="chat-contact-header">
@@ -512,6 +549,7 @@ appRoot.innerHTML = `
           <button class="tool-button terminal-only-control" id="terminal-rename" title="重命名终端" aria-label="重命名终端">${icon("Pencil", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-clear" title="清屏" aria-label="清屏">${icon("Eraser", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-restart" title="重启终端" aria-label="重启终端">${icon("RefreshCw", 15)}</button>
+          <button class="tool-button terminal-only-control" id="terminal-new-chat" title="新对话（pi，可自动恢复）" aria-label="新对话，启动可自动恢复的 pi 会话">${icon("MessageSquarePlus", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-split-left-right" title="左右分屏（新建终端）" aria-label="左右分屏，新建终端">${icon("Columns2", 15)}</button>
           <button class="tool-button terminal-only-control" id="terminal-split-top-bottom" title="上下分屏（新建终端）" aria-label="上下分屏，新建终端">${icon("Rows2", 15)}</button>
           <span class="actionbar-caption" id="conversation-caption">即时消息</span>
@@ -549,6 +587,22 @@ appRoot.innerHTML = `
           </div>
         </div>
       </section>
+
+      <button class="notes-expand" id="notes-expand" type="button" title="展开便签" aria-label="展开便签">便签</button>
+
+      <div class="workspace-splitter notes-splitter" aria-hidden="true"></div>
+
+      <aside class="notes-pane" id="notes-pane" aria-label="便签">
+        <div class="notes-body">
+          <div class="notes-head">
+            <span class="notes-tape" aria-hidden="true"></span>
+            <b>便签</b>
+            <span class="notes-count" id="notes-count">0 字</span>
+            <button class="notes-collapse" id="notes-collapse" type="button" title="收起便签" aria-label="收起便签">${icon("ChevronsRight", 13)}</button>
+          </div>
+          <textarea id="notes-input" lang="zh-CN" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="便签内容，自动保存" placeholder="随手记点什么…（自动保存）"></textarea>
+        </div>
+      </aside>
     </div>
 
     <footer class="status-bar">
@@ -678,11 +732,6 @@ appRoot.innerHTML = `
   </main>
 `;
 
-function query<T extends Element>(selector: string): T {
-  const element = document.querySelector<T>(selector);
-  if (!element) throw new Error(`Missing element: ${selector}`);
-  return element;
-}
 
 const shell = query<HTMLElement>("#app-shell");
 const contactList = query<HTMLDivElement>("#contact-list");
@@ -692,7 +741,6 @@ const terminalHost = query<HTMLDivElement>("#terminal-host");
 const messageInput = query<HTMLTextAreaElement>("#message-input");
 const sendButton = query<HTMLButtonElement>("#send-button");
 const popupMenu = query<HTMLDivElement>("#popup-menu");
-const toast = query<HTMLDivElement>("#toast");
 const terminalRenameDialog = query<HTMLDivElement>("#terminal-rename-dialog");
 const terminalNameInput = query<HTMLInputElement>("#terminal-name-input");
 const terminalRenameError = query<HTMLParagraphElement>("#terminal-rename-error");
@@ -713,34 +761,12 @@ const avatarPreview = query<HTMLImageElement>("#avatar-preview");
 const avatarFileInput = query<HTMLInputElement>("#avatar-file-input");
 const avatarError = query<HTMLParagraphElement>("#avatar-error");
 
-function isTauriRuntime(): boolean {
-  return "__TAURI_INTERNALS__" in window;
-}
 
-function projectContactId(projectId: string): string {
-  return `${PROJECT_CONTACT_PREFIX}${projectId}`;
-}
-
-function projectIdFromContactId(contactId: string | undefined): string | null {
-  return contactId?.startsWith(PROJECT_CONTACT_PREFIX)
-    ? contactId.slice(PROJECT_CONTACT_PREFIX.length)
-    : null;
-}
-
-function projectFolderForContact(contactId = snapshot?.activeContactId): ProjectFolder | null {
+function projectFolderForContact(contactId = state.snapshot?.activeContactId): ProjectFolder | null {
   const projectId = projectIdFromContactId(contactId);
   return projectId ? projectFolders.find((folder) => folder.id === projectId) ?? null : null;
 }
 
-function isProjectContact(contactId = snapshot?.activeContactId): boolean {
-  return projectIdFromContactId(contactId) !== null;
-}
-
-function isTerminalContact(contactId = snapshot?.activeContactId): boolean {
-  return isProjectContact(contactId)
-    || contactId === TERMINAL_CONTACT_ID
-    || /^terminal-\d+$/.test(contactId ?? "");
-}
 
 function projectFolderContact(folder: ProjectFolder): Contact {
   const directory = projectDirectories.find((item) => item.id === folder.directoryId);
@@ -759,912 +785,16 @@ function projectFolderContact(folder: ProjectFolder): Contact {
 }
 
 function syncProjectFolderContacts(): void {
-  snapshot.contacts = snapshot.contacts
+  if (!state.snapshot) return;
+  state.snapshot.contacts = state.snapshot.contacts
     .filter((contact) => !isProjectContact(contact.id))
     .concat(projectFolders.map(projectFolderContact));
 }
 
-function refreshIcons(): void {
-  createIcons({ icons: iconSet });
-}
 
-function ptyBytes(value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (Array.isArray(value)) return Uint8Array.from(value as number[]);
-  if (value && typeof value === "object" && "buffer" in value) {
-    const buffer = (value as { buffer?: unknown }).buffer;
-    if (buffer instanceof ArrayBuffer) return new Uint8Array(buffer);
-  }
-  return new TextEncoder().encode(String(value ?? ""));
-}
-
-async function writeClipboardText(text: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-
-  const textarea = document.createElement("textarea");
-  textarea.value = text;
-  textarea.style.position = "fixed";
-  textarea.style.opacity = "0";
-  textarea.style.pointerEvents = "none";
-  document.body.append(textarea);
-  textarea.select();
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  if (!copied) throw new Error("当前环境不支持写入剪贴板");
-}
-
-async function copyTerminalSelection(pane: TerminalPaneRuntime): Promise<void> {
-  const selection = pane.terminal.getSelection();
-  if (!selection) {
-    showToast("请先选择要复制的终端内容");
-    return;
-  }
-
-  try {
-    await writeClipboardText(selection);
-    showToast("复制成功", "top-right");
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : "复制终端内容失败");
-  } finally {
-    pane.terminal.focus();
-  }
-}
-
-async function pasteTerminalClipboard(pane: TerminalPaneRuntime): Promise<void> {
-  try {
-    if (!navigator.clipboard?.readText) throw new Error("当前环境不支持读取剪贴板");
-    const text = await navigator.clipboard.readText();
-    if (text) pane.terminal.paste(text);
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : "粘贴终端内容失败");
-  } finally {
-    pane.terminal.focus();
-  }
-}
-
-function handleTerminalClipboardShortcut(
-  pane: TerminalPaneRuntime,
-  event: KeyboardEvent,
-): boolean {
-  const isClipboardShortcut =
-    !event.ctrlKey && event.altKey && event.shiftKey && !event.metaKey;
-  if (!isClipboardShortcut || (event.code !== "KeyC" && event.code !== "KeyV")) return true;
-
-  event.preventDefault();
-  event.stopPropagation();
-  if (event.type === "keydown" && !event.repeat) {
-    if (event.code === "KeyC") void copyTerminalSelection(pane);
-    else void pasteTerminalClipboard(pane);
-  }
-  return false;
-}
-
-function terminalWorkspace(
-  contactId = snapshot?.activeContactId,
-  create = false,
-): TerminalWorkspace | null {
-  if (!contactId || !isTerminalContact(contactId)) return null;
-  let workspace = terminalWorkspaces.get(contactId);
-  if (!workspace && create) {
-    workspace = {
-      contactId,
-      projectFolder: projectFolderForContact(contactId),
-      layout: null,
-      activePaneId: null,
-      nextPaneId: 1,
-      fitFrame: null,
-      panes: new Map(),
-    };
-    terminalWorkspaces.set(contactId, workspace);
-  }
-  return workspace ?? null;
-}
-
-function activeTerminalPane(
-  workspace = terminalWorkspace(),
-): TerminalPaneRuntime | null {
-  return !workspace || workspace.activePaneId === null
-    ? null
-    : workspace.panes.get(workspace.activePaneId) ?? null;
-}
-
-function terminalPaneIds(
-  node: TerminalLayoutNode | null = terminalWorkspace()?.layout ?? null,
-  result: number[] = [],
-): number[] {
-  if (!node) return result;
-  if (node.kind === "pane") result.push(node.paneId);
-  else {
-    terminalPaneIds(node.first, result);
-    terminalPaneIds(node.second, result);
-  }
-  return result;
-}
-
-function replaceTerminalPaneNode(
-  node: TerminalLayoutNode,
-  paneId: number,
-  replacement: TerminalLayoutNode,
-): TerminalLayoutNode {
-  if (node.kind === "pane") return node.paneId === paneId ? replacement : node;
-  return {
-    ...node,
-    first: replaceTerminalPaneNode(node.first, paneId, replacement),
-    second: replaceTerminalPaneNode(node.second, paneId, replacement),
-  };
-}
-
-function removeTerminalPaneNode(
-  node: TerminalLayoutNode,
-  paneId: number,
-): TerminalLayoutNode | null {
-  if (node.kind === "pane") return node.paneId === paneId ? null : node;
-  const first = removeTerminalPaneNode(node.first, paneId);
-  const second = removeTerminalPaneNode(node.second, paneId);
-  if (!first) return second;
-  if (!second) return first;
-  return { ...node, first, second };
-}
-
-function updateTerminalPaneVisual(pane: TerminalPaneRuntime): void {
-  pane.element.dataset.state = pane.state;
-  pane.element.classList.toggle(
-    "is-active",
-    pane.id === pane.workspace.activePaneId,
-  );
-}
-
-function terminalPanePosition(
-  paneId: number,
-  workspace = terminalWorkspace(),
-): number {
-  const position = terminalPaneIds(workspace?.layout ?? null).indexOf(paneId);
-  return position < 0 ? 1 : position + 1;
-}
-
-function updateTerminalToolbarState(): void {
-  const workspace = terminalWorkspace();
-  const active = activeTerminalPane(workspace);
-  const paneCount = workspace?.panes.size ?? 0;
-  const splitDisabled = paneCount >= MAX_TERMINAL_PANES;
-  query<HTMLButtonElement>("#terminal-split-left-right").disabled = splitDisabled;
-  query<HTMLButtonElement>("#terminal-split-top-bottom").disabled = splitDisabled;
-  query<HTMLButtonElement>("#terminal-clear").disabled = !active;
-  query<HTMLButtonElement>("#terminal-restart").disabled =
-    !active || active.state === "opening";
-  if (isTerminalContact()) {
-    const contactName = getActiveContact().displayName;
-    query("#conversation-caption").textContent =
-      paneCount > 1 ? `${contactName} · ${paneCount} 个窗格` : `${contactName}会话`;
-  }
-}
-
-function updateTerminalConnectionStatus(): void {
-  if (!snapshot?.activeContactId || !isTerminalContact()) return;
-  const workspace = terminalWorkspace();
-  const pane = activeTerminalPane(workspace);
-  if (!pane) {
-    query("#connection-status").textContent = "正在启动 WSL 终端...";
-    updateTypingStatus();
-    return;
-  }
-  const contactName = getActiveContact().displayName;
-  const label = workspace && workspace.panes.size > 1
-    ? `${contactName} · 窗格 ${terminalPanePosition(pane.id, workspace)}/${workspace.panes.size}`
-    : contactName;
-  const descriptions: Record<TerminalPaneState, string> = {
-    opening: "正在连接 WSL PTY...",
-    connected: "WSL PTY 已连接 · 支持 Codex 流式输出",
-    exited: "会话已结束 · 点击重启",
-    error: "启动失败 · 点击重启",
-  };
-  query("#connection-status").textContent = `${label} · ${descriptions[pane.state]}`;
-  updateTypingStatus();
-}
-
-function setActiveTerminalPane(pane: TerminalPaneRuntime, focus = false): void {
-  const { workspace } = pane;
-  if (pane.disposed || workspace.panes.get(pane.id) !== pane) return;
-  workspace.activePaneId = pane.id;
-  workspace.panes.forEach(updateTerminalPaneVisual);
-  if (snapshot?.activeContactId === workspace.contactId) {
-    updateTerminalToolbarState();
-    updateTerminalConnectionStatus();
-    updateSendState();
-  }
-  if (focus) pane.terminal.focus();
-}
-
-function setSplitElementRatio(
-  node: Extract<TerminalLayoutNode, { kind: "split" }>,
-  first: HTMLElement,
-  second: HTMLElement,
-  divider: HTMLElement,
-  ratio: number,
-): void {
-  node.ratio = Math.max(0.15, Math.min(0.85, ratio));
-  first.style.flex = `${node.ratio} 1 0px`;
-  second.style.flex = `${1 - node.ratio} 1 0px`;
-  divider.setAttribute("aria-valuenow", String(Math.round(node.ratio * 100)));
-}
-
-function updateSplitRatioFromPointer(
-  event: PointerEvent,
-  workspace: TerminalWorkspace,
-  node: Extract<TerminalLayoutNode, { kind: "split" }>,
-  container: HTMLElement,
-  first: HTMLElement,
-  second: HTMLElement,
-  divider: HTMLElement,
-): void {
-  const rect = container.getBoundingClientRect();
-  const dividerSize = node.direction === "left-right"
-    ? divider.offsetWidth
-    : divider.offsetHeight;
-  const available = (node.direction === "left-right" ? rect.width : rect.height) - dividerSize;
-  if (available <= 2) return;
-  const pointer = node.direction === "left-right"
-    ? event.clientX - rect.left
-    : event.clientY - rect.top;
-  const minimumRatio = Math.min(0.42, Math.max(0.15, 92 / available));
-  const ratio = Math.max(
-    minimumRatio,
-    Math.min(1 - minimumRatio, (pointer - dividerSize / 2) / available),
-  );
-  setSplitElementRatio(node, first, second, divider, ratio);
-  scheduleTerminalFit(workspace);
-}
-
-function renderTerminalLayoutNode(
-  node: TerminalLayoutNode,
-  workspace: TerminalWorkspace,
-): HTMLElement {
-  if (node.kind === "pane") {
-    const pane = workspace.panes.get(node.paneId);
-    if (!pane) throw new Error(`Missing terminal pane: ${node.paneId}`);
-    pane.element.style.flex = "";
-    return pane.element;
-  }
-
-  const container = document.createElement("div");
-  container.className = `terminal-split terminal-split--${node.direction}`;
-  const first = renderTerminalLayoutNode(node.first, workspace);
-  const second = renderTerminalLayoutNode(node.second, workspace);
-  const divider = document.createElement("div");
-  divider.className = `terminal-divider terminal-divider--${node.direction}`;
-  divider.tabIndex = 0;
-  divider.role = "separator";
-  divider.setAttribute(
-    "aria-orientation",
-    node.direction === "left-right" ? "vertical" : "horizontal",
-  );
-  divider.setAttribute(
-    "aria-label",
-    node.direction === "left-right" ? "调整左右分屏比例" : "调整上下分屏比例",
-  );
-  divider.setAttribute("aria-valuemin", "15");
-  divider.setAttribute("aria-valuemax", "85");
-  setSplitElementRatio(node, first, second, divider, node.ratio);
-
-  divider.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    divider.classList.add("is-dragging");
-    divider.setPointerCapture(event.pointerId);
-    const move = (moveEvent: PointerEvent) => {
-      updateSplitRatioFromPointer(
-        moveEvent,
-        workspace,
-        node,
-        container,
-        first,
-        second,
-        divider,
-      );
-    };
-    const finish = () => {
-      divider.classList.remove("is-dragging");
-      divider.removeEventListener("pointermove", move);
-      divider.removeEventListener("pointerup", finish);
-      divider.removeEventListener("pointercancel", finish);
-      scheduleTerminalFit(workspace);
-    };
-    divider.addEventListener("pointermove", move);
-    divider.addEventListener("pointerup", finish);
-    divider.addEventListener("pointercancel", finish);
-  });
-  divider.addEventListener("keydown", (event) => {
-    const decrementKey = node.direction === "left-right" ? "ArrowLeft" : "ArrowUp";
-    const incrementKey = node.direction === "left-right" ? "ArrowRight" : "ArrowDown";
-    let ratio = node.ratio;
-    if (event.key === decrementKey) ratio -= 0.05;
-    else if (event.key === incrementKey) ratio += 0.05;
-    else if (event.key === "Home") ratio = 0.2;
-    else if (event.key === "End") ratio = 0.8;
-    else return;
-    event.preventDefault();
-    setSplitElementRatio(node, first, second, divider, ratio);
-    scheduleTerminalFit(workspace);
-  });
-
-  container.append(first, divider, second);
-  return container;
-}
-
-function renderTerminalLayout(workspace: TerminalWorkspace): void {
-  if (snapshot?.activeContactId !== workspace.contactId) return;
-  const ids = terminalPaneIds(workspace.layout);
-  terminalHost.classList.toggle("is-split", ids.length > 1);
-  if (workspace.layout) {
-    terminalHost.replaceChildren(renderTerminalLayoutNode(workspace.layout, workspace));
-  }
-  else terminalHost.replaceChildren();
-  ids.forEach((paneId, index) => {
-    const pane = workspace.panes.get(paneId);
-    if (!pane) return;
-    pane.title.textContent = `WSL 终端 ${index + 1}`;
-    pane.element.setAttribute("aria-label", `WSL 终端窗格 ${index + 1}`);
-    pane.closeButton.disabled = ids.length <= 1;
-    updateTerminalPaneVisual(pane);
-  });
-  updateTerminalToolbarState();
-  scheduleTerminalFit(workspace);
-}
-
-function queuePanePtyWrite(pane: TerminalPaneRuntime, data: Uint8Array): void {
-  const sessionId = pane.sessionId;
-  const generation = pane.generation;
-  if (!sessionId || data.length === 0 || pane.disposed) return;
-  pane.writeQueue = pane.writeQueue
-    .catch(() => undefined)
-    .then(() => {
-      if (
-        pane.disposed ||
-        pane.generation !== generation ||
-        pane.sessionId !== sessionId
-      ) return;
-      return backend.writePty(sessionId, data);
-    })
-    .catch((error) => {
-      if (pane.generation === generation && pane.sessionId === sessionId) {
-        showToast(error instanceof Error ? error.message : "终端输入失败");
-      }
-    });
-}
-
-function resizeTerminalPaneToFit(pane: TerminalPaneRuntime): void {
-  if (
-    pane.disposed ||
-    !pane.mounted ||
-    terminalHost.hidden ||
-    snapshot?.activeContactId !== pane.workspace.contactId
-  ) return;
-  if (pane.surface.clientWidth < 2 || pane.surface.clientHeight < 2) return;
-  try {
-    pane.fit.fit();
-  } catch {
-    // Layout transitions can expose a zero-sized pane for one animation frame.
-  }
-}
-
-function fitAllTerminalPanes(workspace = terminalWorkspace()): void {
-  if (!workspace || snapshot?.activeContactId !== workspace.contactId) return;
-  workspace.panes.forEach(resizeTerminalPaneToFit);
-}
-
-function scheduleTerminalFit(workspace = terminalWorkspace()): void {
-  if (!workspace || workspace.fitFrame !== null) return;
-  workspace.fitFrame = requestAnimationFrame(() => {
-    workspace.fitFrame = null;
-    fitAllTerminalPanes(workspace);
-  });
-}
-
-function schedulePanePtyResize(
-  pane: TerminalPaneRuntime,
-  rows: number,
-  cols: number,
-): void {
-  const sessionId = pane.sessionId;
-  const generation = pane.generation;
-  if (!sessionId || pane.disposed) return;
-  if (pane.resizeTimer !== null) window.clearTimeout(pane.resizeTimer);
-  pane.resizeTimer = window.setTimeout(() => {
-    pane.resizeTimer = null;
-    pane.resizeQueue = pane.resizeQueue
-      .catch(() => undefined)
-      .then(() => {
-        if (
-          pane.disposed ||
-          pane.generation !== generation ||
-          pane.sessionId !== sessionId
-        ) return;
-        return backend.resizePty(sessionId, rows, cols);
-      })
-      .catch((error) => {
-        if (pane.generation === generation && pane.sessionId === sessionId) {
-          showToast(error instanceof Error ? error.message : "终端大小同步失败");
-        }
-      });
-  }, 45);
-}
-
-function handleTerminalPaneExit(
-  pane: TerminalPaneRuntime,
-  generation: number,
-  exit: PtyExit,
-): void {
-  if (
-    pane.disposed ||
-    pane.generation !== generation ||
-    pane.sessionId !== exit.sessionId
-  ) return;
-  pane.sessionId = null;
-  pane.state = exit.error ? "error" : "exited";
-  const notice = exit.error
-    ? `\r\n\r\n[终端错误] ${exit.error}\r\n`
-    : `\r\n\r\n[终端已退出，exit ${exit.exitCode ?? "?"}${exit.signal ? ` · ${exit.signal}` : ""}]\r\n`;
-  pane.terminal.write(notice);
-  updateTerminalPaneVisual(pane);
-  if (snapshot?.activeContactId === pane.workspace.contactId) {
-    updateTerminalToolbarState();
-    updateTerminalConnectionStatus();
-  }
-}
-
-function cacheProjectFolderResolution(
-  workspace: TerminalWorkspace,
-  location: ProjectFolderLocation,
-): void {
-  const folder = workspace.projectFolder;
-  const cache = projectLaunchCache(location);
-  if (!folder || !cache) return;
-  const current = projectFolders.find((item) => item.id === folder.id);
-  if (!current) return;
-
-  const updated: ProjectFolder = {
-    ...current,
-    path: location.path,
-    ...cache,
-  };
-  try {
-    saveProjectFolders(projectFolders.map((item) => item.id === updated.id ? updated : item));
-  } catch {
-    return;
-  }
-  workspace.projectFolder = updated;
-  syncProjectFolderContacts();
-  renderContacts();
-  if (snapshot.activeContactId === workspace.contactId) renderChatHeader();
-}
-
-async function openTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
-  if (!isTauriRuntime() || pane.disposed || pane.sessionId) return;
-  if (pane.openPromise) return pane.openPromise;
-  const generation = ++pane.generation;
-  pane.state = "opening";
-  updateTerminalPaneVisual(pane);
-  if (snapshot?.activeContactId === pane.workspace.contactId) {
-    updateTerminalToolbarState();
-    updateTerminalConnectionStatus();
-  }
-  resizeTerminalPaneToFit(pane);
-
-  let returnedSessionId: number | null = null;
-  let earlyExit: PtyExit | null = null;
-  let opening!: Promise<void>;
-  opening = (async () => {
-    const rows = Math.max(1, pane.terminal.rows || 24);
-    const cols = Math.max(2, pane.terminal.cols || 80);
-    const opened = await backend.openPty(
-      rows,
-      cols,
-      (data) => {
-        if (
-          !pane.disposed &&
-          pane.generation === generation &&
-          pane.workspace.panes.get(pane.id) === pane
-        ) pane.terminal.write(ptyBytes(data));
-      },
-      (exit) => {
-        if (returnedSessionId === null) earlyExit = exit;
-        else handleTerminalPaneExit(pane, generation, exit);
-      },
-      pane.workspace.projectFolder ?? undefined,
-    );
-    returnedSessionId = opened.sessionId;
-    if (
-      pane.disposed ||
-      pane.generation !== generation ||
-      pane.workspace.panes.get(pane.id) !== pane
-    ) {
-      await backend.closePty(opened.sessionId);
-      return;
-    }
-    pane.sessionId = opened.sessionId;
-    if (opened.project) cacheProjectFolderResolution(pane.workspace, opened.project);
-    pane.state = "connected";
-    updateTerminalPaneVisual(pane);
-    resizeTerminalPaneToFit(pane);
-    if (earlyExit) handleTerminalPaneExit(pane, generation, earlyExit);
-    if (snapshot?.activeContactId === pane.workspace.contactId) {
-      updateTerminalToolbarState();
-      updateTerminalConnectionStatus();
-    }
-  })()
-    .catch((error) => {
-      if (
-        pane.disposed ||
-        pane.generation !== generation ||
-        pane.workspace.panes.get(pane.id) !== pane
-      ) return;
-      pane.state = "error";
-      pane.terminal.write(
-        `\r\n[无法启动终端] ${error instanceof Error ? error.message : String(error)}\r\n`,
-      );
-      updateTerminalPaneVisual(pane);
-      showToast(error instanceof Error ? error.message : "无法启动终端");
-      if (snapshot?.activeContactId === pane.workspace.contactId) {
-        updateTerminalToolbarState();
-        updateTerminalConnectionStatus();
-      }
-    })
-    .finally(() => {
-      if (pane.openPromise === opening) pane.openPromise = null;
-    });
-  pane.openPromise = opening;
-  return opening;
-}
-
-function handlePreviewTerminalInput(pane: TerminalPaneRuntime, data: string): void {
-  for (const character of data) {
-    if (character === "\r" || character === "\n") {
-      const command = pane.lineBuffer.trim();
-      pane.lineBuffer = "";
-      pane.terminal.write("\r\n");
-      if (!command) {
-        pane.terminal.write("wsl$ ");
-        continue;
-      }
-      void backend
-        .executeTerminal(
-          command,
-          pane.workspace.contactId,
-          pane.workspace.projectFolder?.path,
-        )
-        .then((execution) => {
-          if (!pane.disposed) {
-            pane.terminal.write(
-              `${execution.outputMessage.text.replace(/\n/g, "\r\n")}\r\nwsl$ `,
-            );
-          }
-        })
-        .catch((error) => {
-          if (!pane.disposed) {
-            pane.terminal.write(
-              `[error] ${error instanceof Error ? error.message : String(error)}\r\nwsl$ `,
-            );
-          }
-        });
-    } else if (character === "\u007f" || character === "\b") {
-      if (pane.lineBuffer.length > 0) {
-        pane.lineBuffer = pane.lineBuffer.slice(0, -1);
-        pane.terminal.write("\b \b");
-      }
-    } else if (character >= " ") {
-      pane.lineBuffer += character;
-      pane.terminal.write(character);
-    }
-  }
-}
-
-function createTerminalPane(workspace: TerminalWorkspace): TerminalPaneRuntime {
-  const id = workspace.nextPaneId++;
-  const element = document.createElement("section");
-  element.className = "terminal-pane";
-  element.dataset.paneId = String(id);
-  element.setAttribute("role", "group");
-
-  const titlebar = document.createElement("header");
-  titlebar.className = "terminal-pane-titlebar";
-  const lamp = document.createElement("span");
-  lamp.className = "terminal-pane-lamp";
-  lamp.setAttribute("aria-hidden", "true");
-  const title = document.createElement("strong");
-  title.className = "terminal-pane-title";
-  title.textContent = "WSL 终端";
-  const detail = document.createElement("span");
-  detail.className = "terminal-pane-detail";
-  detail.textContent = "WSL PTY";
-  const closeButton = document.createElement("button");
-  closeButton.type = "button";
-  closeButton.className = "terminal-pane-close";
-  closeButton.title = "关闭此终端窗格";
-  closeButton.setAttribute("aria-label", "关闭此终端窗格");
-  closeButton.textContent = "×";
-  titlebar.append(lamp, title, detail, closeButton);
-
-  const surface = document.createElement("div");
-  surface.className = "terminal-pane-surface";
-  surface.lang = "zh-CN";
-  element.append(titlebar, surface);
-
-  const terminal = new XtermTerminal({
-    allowTransparency: false,
-    convertEol: false,
-    cursorBlink: true,
-    cursorStyle: "bar",
-    disableStdin: false,
-    fontFamily: '"Cascadia Mono", "JetBrains Mono", "Noto Sans Mono CJK SC", "WenQuanYi Micro Hei Mono", Consolas, monospace',
-    fontSize: 14,
-    lineHeight: 1.25,
-    scrollback: 20_000,
-    smoothScrollDuration: 0,
-    tabStopWidth: 8,
-    theme: {
-      background: "#fffdf3",
-      foreground: "#1d2428",
-      cursor: "#0050ee",
-      cursorAccent: "#fffdf3",
-      selectionBackground: "#b9d5f4",
-      black: "#172026",
-      red: "#a52a2a",
-      green: "#176b35",
-      yellow: "#886900",
-      blue: "#1e4f9b",
-      magenta: "#7c3f7b",
-      cyan: "#1d6971",
-      white: "#d7d5c9",
-      brightBlack: "#5e666b",
-      brightRed: "#be3f3f",
-      brightGreen: "#237f43",
-      brightYellow: "#a17f00",
-      brightBlue: "#316ac5",
-      brightMagenta: "#9a5a9a",
-      brightCyan: "#2d8b91",
-      brightWhite: "#ffffff",
-    },
-  });
-  const fit = new FitAddon();
-  terminal.loadAddon(fit);
-  const pane: TerminalPaneRuntime = {
-    workspace,
-    id,
-    element,
-    surface,
-    title,
-    closeButton,
-    terminal,
-    fit,
-    resizeObserver: null,
-    sessionId: null,
-    openPromise: null,
-    lifecycleQueue: Promise.resolve(),
-    writeQueue: Promise.resolve(),
-    resizeQueue: Promise.resolve(),
-    resizeTimer: null,
-    lineBuffer: "",
-    generation: 0,
-    state: isTauriRuntime() ? "opening" : "connected",
-    mounted: false,
-    disposed: false,
-    disposables: [],
-  };
-  terminal.attachCustomKeyEventHandler((event) => handleTerminalClipboardShortcut(pane, event));
-  element.addEventListener(
-    "mousedown",
-    (event) => {
-      if ((event.target as Element).closest(".terminal-pane-close")) return;
-      setActiveTerminalPane(pane);
-    },
-    { capture: true },
-  );
-  element.addEventListener("focusin", () => setActiveTerminalPane(pane));
-  titlebar.addEventListener("mousedown", (event) => {
-    if ((event.target as Element).closest(".terminal-pane-close")) return;
-    window.setTimeout(() => pane.terminal.focus(), 0);
-  });
-  closeButton.addEventListener("click", (event) => {
-    event.stopPropagation();
-    void closeTerminalPane(pane);
-  });
-  return pane;
-}
-
-function mountTerminalPane(pane: TerminalPaneRuntime): void {
-  if (pane.mounted || pane.disposed) return;
-  pane.terminal.open(pane.surface);
-  pane.mounted = true;
-  pane.disposables.push(
-    pane.terminal.onData((data) => {
-      if (isTauriRuntime()) queuePanePtyWrite(pane, new TextEncoder().encode(data));
-      else handlePreviewTerminalInput(pane, data);
-    }),
-    pane.terminal.onBinary((data) => {
-      if (isTauriRuntime()) {
-        queuePanePtyWrite(
-          pane,
-          Uint8Array.from(data, (character) => character.charCodeAt(0) & 0xff),
-        );
-      }
-    }),
-    pane.terminal.onResize(({ rows, cols }) => {
-      schedulePanePtyResize(pane, rows, cols);
-    }),
-  );
-  pane.resizeObserver = new ResizeObserver(() => scheduleTerminalFit(pane.workspace));
-  pane.resizeObserver.observe(pane.surface);
-  if (!isTauriRuntime()) {
-    const projectLine = pane.workspace.projectFolder
-      ? `项目目录：${pane.workspace.projectFolder.path}\r\n`
-      : "";
-    pane.terminal.write(`Retro Messenger WSL 终端预览\r\n${projectLine}输入 help 查看模拟 Linux 命令。\r\nwsl$ `);
-  }
-  resizeTerminalPaneToFit(pane);
-}
-
-function ensureTerminal(
-  focus = true,
-  contactId = snapshot?.activeContactId,
-): TerminalPaneRuntime | null {
-  const workspace = terminalWorkspace(contactId, true);
-  if (!workspace || snapshot?.activeContactId !== workspace.contactId) return null;
-  terminalHost.hidden = false;
-  transcript.hidden = true;
-  if (!workspace.layout) {
-    const pane = createTerminalPane(workspace);
-    workspace.panes.set(pane.id, pane);
-    workspace.layout = { kind: "pane", paneId: pane.id };
-    workspace.activePaneId = pane.id;
-    renderTerminalLayout(workspace);
-    mountTerminalPane(pane);
-  } else {
-    renderTerminalLayout(workspace);
-  }
-  fitAllTerminalPanes(workspace);
-  workspace.panes.forEach((pane) => {
-    if (isTauriRuntime() && !pane.sessionId && !pane.openPromise) {
-      void openTerminalPane(pane);
-    }
-  });
-  const active = activeTerminalPane(workspace);
-  if (focus) active?.terminal.focus();
-  scheduleTerminalFit(workspace);
-  return active;
-}
-
-async function splitActiveTerminal(direction: TerminalSplitDirection): Promise<void> {
-  const workspace = terminalWorkspace();
-  const active = ensureTerminal(false);
-  if (!workspace || !active || !workspace.layout) return;
-  if (workspace.panes.size >= MAX_TERMINAL_PANES) {
-    showToast(`最多可同时打开 ${MAX_TERMINAL_PANES} 个终端窗格`);
-    return;
-  }
-  const pane = createTerminalPane(workspace);
-  workspace.panes.set(pane.id, pane);
-  workspace.layout = replaceTerminalPaneNode(workspace.layout, active.id, {
-    kind: "split",
-    direction,
-    ratio: 0.5,
-    first: { kind: "pane", paneId: active.id },
-    second: { kind: "pane", paneId: pane.id },
-  });
-  workspace.activePaneId = pane.id;
-  renderTerminalLayout(workspace);
-  mountTerminalPane(pane);
-  setActiveTerminalPane(pane, true);
-  fitAllTerminalPanes(workspace);
-  if (isTauriRuntime()) await openTerminalPane(pane);
-  scheduleTerminalFit(workspace);
-}
-
-async function disposeTerminalPane(
-  pane: TerminalPaneRuntime,
-  alreadyInvalidated = false,
-): Promise<void> {
-  if (pane.disposed && !alreadyInvalidated) return;
-  if (!alreadyInvalidated) {
-    pane.disposed = true;
-    pane.generation += 1;
-  }
-  if (pane.resizeTimer !== null) {
-    window.clearTimeout(pane.resizeTimer);
-    pane.resizeTimer = null;
-  }
-  pane.resizeObserver?.disconnect();
-  pane.resizeObserver = null;
-  pane.disposables.splice(0).forEach((disposable) => disposable.dispose());
-  const sessionId = pane.sessionId;
-  pane.sessionId = null;
-  pane.terminal.dispose();
-  if (sessionId) await backend.closePty(sessionId);
-}
-
-async function disposeTerminalWorkspace(contactId: string): Promise<void> {
-  const workspace = terminalWorkspaces.get(contactId);
-  if (!workspace) return;
-  if (workspace.fitFrame !== null) cancelAnimationFrame(workspace.fitFrame);
-  workspace.fitFrame = null;
-  const panes = [...workspace.panes.values()];
-  workspace.panes.clear();
-  workspace.layout = null;
-  workspace.activePaneId = null;
-  terminalWorkspaces.delete(contactId);
-  await Promise.all(panes.map((pane) => disposeTerminalPane(pane)));
-}
-
-async function closeTerminalPane(pane: TerminalPaneRuntime): Promise<void> {
-  const { workspace } = pane;
-  if (workspace.panes.size <= 1 || !workspace.layout) return;
-  if (workspace.panes.get(pane.id) !== pane) return;
-  const previousIds = terminalPaneIds(workspace.layout);
-  const previousIndex = previousIds.indexOf(pane.id);
-  pane.disposed = true;
-  pane.generation += 1;
-  workspace.panes.delete(pane.id);
-  workspace.layout = removeTerminalPaneNode(workspace.layout, pane.id);
-  const remainingIds = terminalPaneIds(workspace.layout);
-  if (workspace.activePaneId === pane.id) {
-    workspace.activePaneId =
-      remainingIds[Math.min(Math.max(previousIndex, 0), remainingIds.length - 1)] ?? null;
-  }
-  renderTerminalLayout(workspace);
-  await disposeTerminalPane(pane, true);
-  const active = activeTerminalPane(workspace);
-  if (active) setActiveTerminalPane(active, true);
-  scheduleTerminalFit(workspace);
-}
-
-async function restartTerminalPaneNow(pane: TerminalPaneRuntime): Promise<void> {
-  if (pane.disposed || pane.workspace.panes.get(pane.id) !== pane) return;
-  pane.generation += 1;
-  const pendingOpen = pane.openPromise;
-  pane.writeQueue = Promise.resolve();
-  pane.resizeQueue = Promise.resolve();
-  if (pane.resizeTimer !== null) {
-    window.clearTimeout(pane.resizeTimer);
-    pane.resizeTimer = null;
-  }
-  if (pendingOpen) await pendingOpen;
-  if (pane.disposed) return;
-  const oldSession = pane.sessionId;
-  pane.sessionId = null;
-  if (oldSession) await backend.closePty(oldSession);
-  if (pane.disposed) return;
-  pane.terminal.reset();
-  pane.terminal.clear();
-  pane.terminal.write("Retro Messenger WSL terminal\r\n");
-  pane.lineBuffer = "";
-  if (isTauriRuntime()) await openTerminalPane(pane);
-  else {
-    pane.state = "connected";
-    pane.terminal.write("wsl$ ");
-  }
-  updateTerminalPaneVisual(pane);
-  if (snapshot?.activeContactId === pane.workspace.contactId) {
-    updateTerminalToolbarState();
-    updateTerminalConnectionStatus();
-  }
-  pane.terminal.focus();
-}
-
-async function restartTerminal(): Promise<void> {
-  const pane = activeTerminalPane();
-  if (!pane) return;
-  pane.lifecycleQueue = pane.lifecycleQueue
-    .catch(() => undefined)
-    .then(() => restartTerminalPaneNow(pane));
-  return pane.lifecycleQueue;
-}
-
+/** 新对话（pi）：由 qqcodex 生成会话 id/名字启动 pi，崩溃后可精确恢复。 */
 function getActiveContact(): Contact {
-  const contact = snapshot.contacts.find((item) => item.id === snapshot.activeContactId);
+  const contact = state.snapshot.contacts.find((item) => item.id === state.snapshot.activeContactId);
   if (!contact) throw new Error("Active contact is missing");
   return contact;
 }
@@ -1692,17 +822,6 @@ function updateClock(): void {
   }).format(Date.now());
 }
 
-function showToast(text: string, placement: "bottom-right" | "top-right" = "bottom-right"): void {
-  if (toastTimer !== null) window.clearTimeout(toastTimer);
-  toast.textContent = text;
-  toast.classList.toggle("is-top-right", placement === "top-right");
-  toast.hidden = false;
-  toastTimer = window.setTimeout(() => {
-    toast.hidden = true;
-    toast.classList.remove("is-top-right");
-    toastTimer = null;
-  }, 2200);
-}
 
 function updateZoomControls(): void {
   const index = ZOOM_LEVELS.indexOf(currentZoom);
@@ -1742,14 +861,214 @@ function changePageZoom(step: -1 | 1): void {
   if (nextIndex !== index) void applyPageZoom(ZOOM_LEVELS[nextIndex]);
 }
 
+function readStoredRosterCollapsed(): boolean {
+  try {
+    return localStorage.getItem(ROSTER_COLLAPSED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function applyRosterCollapsed(collapsed: boolean, announce = false): void {
+  rosterCollapsed = collapsed;
+  query<HTMLElement>(".workspace").classList.toggle("roster-collapsed", collapsed);
+  const toggle = query<HTMLButtonElement>("#roster-collapse-toggle");
+  const label = collapsed ? "展开好友列表" : "收起好友列表";
+  toggle.innerHTML = icon(collapsed ? "ChevronsRight" : "ChevronsLeft", 13);
+  toggle.title = `${label} (Ctrl+B)`;
+  toggle.setAttribute("aria-label", label);
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  refreshIcons();
+  try {
+    localStorage.setItem(ROSTER_COLLAPSED_STORAGE_KEY, collapsed ? "1" : "0");
+  } catch {
+    if (announce) showToast("无法保存好友列表折叠状态");
+  }
+  requestAnimationFrame(() => scheduleTerminalFit());
+  if (announce) showToast(collapsed ? "好友列表已收起" : "好友列表已展开");
+}
+
+function toggleRosterCollapsed(): void {
+  applyRosterCollapsed(!rosterCollapsed, true);
+}
+
+// ── 右侧便签纸面板：折叠/展开 + 按联系人分存 + 宽度可拖拽 ──
+// 桌面版便签存 exe 同目录 notes.json（便携）；浏览器预览降级 localStorage。
+const NOTES_STORAGE_KEY = "ociq.ui.notes";
+const NOTES_COLLAPSED_STORAGE_KEY = "ociq.ui.notes-collapsed";
+const NOTES_WIDTH_STORAGE_KEY = "ociq.ui.notes-width";
+const NOTES_WIDTH_MIN = 180;
+const NOTES_WIDTH_MAX = 480;
+let notesContactId: string | null = null;
+let notesSaveTimer: number | null = null;
+let notesMap: Record<string, string> | null = null; // null = 尚未从后端加载
+
+function notesKey(contactId: string | null): string {
+  return contactId ?? "_default";
+}
+
+/** 桌面版：从 exe 同目录 notes.json 载入（失败静默降级 localStorage 已有内容） */
+async function loadNotesMap(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    notesMap = await backend.readNotes();
+  } catch {
+    notesMap = {};
+  }
+}
+
+function readNotesEntry(key: string): string {
+  if (notesMap !== null) return notesMap[key] ?? "";
+  try {
+    return localStorage.getItem(`${NOTES_STORAGE_KEY}.${key}`) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeNotesEntry(key: string, value: string): void {
+  if (notesMap !== null) {
+    notesMap[key] = value;
+  } else {
+    try {
+      localStorage.setItem(`${NOTES_STORAGE_KEY}.${key}`, value);
+    } catch {
+      // 存储不可用时静默，下次输入重试
+    }
+  }
+}
+
+function readStoredNotesCollapsed(): boolean {
+  try {
+    return localStorage.getItem(NOTES_COLLAPSED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function applyNotesCollapsed(collapsed: boolean, announce = false): void {
+  query<HTMLElement>(".workspace").classList.toggle("notes-collapsed", collapsed);
+  try {
+    localStorage.setItem(NOTES_COLLAPSED_STORAGE_KEY, collapsed ? "1" : "0");
+  } catch {
+    if (announce) showToast("无法保存便签折叠状态");
+  }
+  requestAnimationFrame(() => scheduleTerminalFit());
+  if (announce) showToast(collapsed ? "便签已收起" : "便签已展开");
+  if (!collapsed) query<HTMLTextAreaElement>("#notes-input").focus();
+}
+
+function updateNotesCount(): void {
+  const input = query<HTMLTextAreaElement>("#notes-input");
+  query("#notes-count").textContent = `${input.value.length} 字`;
+}
+
+async function persistNotesMap(): Promise<void> {
+  if (notesMap === null || !isTauriRuntime()) return;
+  try {
+    await backend.writeNotes(notesMap);
+  } catch {
+    // 写盘失败保持内存态，下次保存重试
+  }
+}
+
+function flushNotesSave(): void {
+  if (notesSaveTimer === null) return;
+  window.clearTimeout(notesSaveTimer);
+  notesSaveTimer = null;
+  writeNotesEntry(notesKey(notesContactId), query<HTMLTextAreaElement>("#notes-input").value);
+  void persistNotesMap();
+}
+
+function scheduleNotesSave(): void {
+  if (notesSaveTimer !== null) window.clearTimeout(notesSaveTimer);
+  notesSaveTimer = window.setTimeout(() => {
+    notesSaveTimer = null;
+    writeNotesEntry(notesKey(notesContactId), query<HTMLTextAreaElement>("#notes-input").value);
+    void persistNotesMap();
+  }, 400);
+}
+
+/** 切换联系人：先把旧内容落盘，再载入该联系人自己的便签 */
+function loadNotesForContact(contactId: string): void {
+  if (notesContactId === contactId) return;
+  flushNotesSave();
+  notesContactId = contactId;
+  query<HTMLTextAreaElement>("#notes-input").value = readNotesEntry(notesKey(contactId));
+  updateNotesCount();
+}
+
+function applyNotesWidth(width: number): void {
+  const clamped = Math.min(NOTES_WIDTH_MAX, Math.max(NOTES_WIDTH_MIN, Math.round(width)));
+  query<HTMLElement>(".workspace").style.setProperty("--notes-width", `${clamped}px`);
+}
+
+function initNotesSplitterDrag(): void {
+  const splitter = query<HTMLElement>(".notes-splitter");
+  splitter.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    splitter.classList.add("is-dragging");
+    splitter.setPointerCapture(event.pointerId);
+    const workspaceRect = query<HTMLElement>(".workspace").getBoundingClientRect();
+    const move = (moveEvent: PointerEvent) => {
+      applyNotesWidth(workspaceRect.right - moveEvent.clientX);
+    };
+    const finish = () => {
+      splitter.classList.remove("is-dragging");
+      splitter.removeEventListener("pointermove", move);
+      splitter.removeEventListener("pointerup", finish);
+      splitter.removeEventListener("pointercancel", finish);
+      try {
+        localStorage.setItem(
+          NOTES_WIDTH_STORAGE_KEY,
+          query<HTMLElement>(".workspace").style.getPropertyValue("--notes-width") || "236px",
+        );
+      } catch {
+        // 无法持久化时仅本次生效
+      }
+      scheduleTerminalFit();
+    };
+    splitter.addEventListener("pointermove", move);
+    splitter.addEventListener("pointerup", finish);
+    splitter.addEventListener("pointercancel", finish);
+  });
+}
+
+async function initNotesPane(): Promise<void> {
+  await loadNotesMap();
+  const input = query<HTMLTextAreaElement>("#notes-input");
+  updateNotesCount();
+  input.addEventListener("input", () => {
+    updateNotesCount();
+    scheduleNotesSave();
+  });
+  query<HTMLButtonElement>("#notes-collapse").addEventListener("click", () => {
+    applyNotesCollapsed(true, true);
+  });
+  query<HTMLButtonElement>("#notes-expand").addEventListener("click", () => {
+    applyNotesCollapsed(false, true);
+  });
+  initNotesSplitterDrag();
+  try {
+    const storedWidth = Number.parseInt(localStorage.getItem(NOTES_WIDTH_STORAGE_KEY) ?? "", 10);
+    if (Number.isFinite(storedWidth) && storedWidth >= NOTES_WIDTH_MIN) applyNotesWidth(storedWidth);
+  } catch {
+    // 无保存宽度时用 CSS 默认 236px
+  }
+  applyNotesCollapsed(readStoredNotesCollapsed());
+  notesContactId = null; // 强制下面这次载入生效（renderChatHeader 可能已用空 map 跑过）
+  loadNotesForContact(state.snapshot.activeContactId);
+}
+
 function updateAvatarUi(): void {
   const source = selfAvatarSource();
   query<HTMLImageElement>("#self-avatar").src = source;
   query<HTMLImageElement>("#title-avatar").src = source;
   query<HTMLImageElement>("#about-avatar").src = source;
-  if (snapshot) {
+  if (state.snapshot) {
     renderContacts();
-    if (snapshot.activeContactId === snapshot.currentUser.id) renderChatHeader();
+    if (state.snapshot.activeContactId === state.snapshot.currentUser.id) renderChatHeader();
   }
 }
 
@@ -1830,17 +1149,17 @@ function saveAvatar(): void {
 }
 
 function updateProfile(): void {
-  query("#self-display-name").textContent = snapshot.currentUser.displayName;
-  query("#self-state").textContent = `[${presenceText[snapshot.currentUser.presence]}] ${snapshot.currentUser.statusMessage}`;
+  query("#self-display-name").textContent = state.snapshot.currentUser.displayName;
+  query("#self-state").textContent = `[${presenceText[state.snapshot.currentUser.presence]}] ${state.snapshot.currentUser.statusMessage}`;
   const dot = query<HTMLElement>(".self-profile .presence-dot");
-  dot.className = `presence-dot ${snapshot.currentUser.presence}`;
+  dot.className = `presence-dot ${state.snapshot.currentUser.presence}`;
 }
 
 function filteredContacts(): Contact[] {
   if (activeTab === "groups") return [];
 
   const normalized = filterText.trim().toLocaleLowerCase();
-  const filtered = snapshot.contacts.filter((contact) => {
+  const filtered = state.snapshot.contacts.filter((contact) => {
     if (isProjectContact(contact.id)) return false;
     if (!normalized) return true;
     return `${contact.displayName} ${contact.account} ${contact.statusMessage}`
@@ -1859,10 +1178,10 @@ function contactRow(contact: Contact): HTMLButtonElement {
   button.type = "button";
   button.className = `contact-row ${contact.presence}`;
   if (isTerminalContact(contact.id)) button.classList.add("terminal-contact");
-  if (contact.id === snapshot.activeContactId) button.classList.add("selected");
+  if (contact.id === state.snapshot.activeContactId) button.classList.add("selected");
   button.dataset.contactId = contact.id;
   button.setAttribute("role", "option");
-  button.setAttribute("aria-selected", String(contact.id === snapshot.activeContactId));
+  button.setAttribute("aria-selected", String(contact.id === state.snapshot.activeContactId));
 
   const avatar = document.createElement("span");
   avatar.className = "contact-avatar avatar-frame";
@@ -1912,25 +1231,27 @@ function projectFolderRow(folder: ProjectFolder): HTMLElement {
   const wrapper = document.createElement("div");
   wrapper.className = "project-folder-row-wrap project-directory-child";
   wrapper.dataset.projectId = folder.id;
+  const aiState = projectAiStates.get(folder.id) ?? "idle";
+  if (aiState !== "idle") wrapper.dataset.aiState = aiState;
 
   const button = document.createElement("button");
   button.type = "button";
   button.className = "project-folder-row";
-  if (contactId === snapshot.activeContactId) button.classList.add("selected");
+  if (contactId === state.snapshot.activeContactId) button.classList.add("selected");
   button.dataset.projectId = folder.id;
   button.setAttribute("role", "option");
-  button.setAttribute("aria-selected", String(contactId === snapshot.activeContactId));
+  button.setAttribute("aria-selected", String(contactId === state.snapshot.activeContactId));
   button.title = folder.path;
 
   const folderIcon = document.createElement("span");
   folderIcon.className = "project-folder-icon";
-  folderIcon.innerHTML = icon(contactId === snapshot.activeContactId ? "FolderOpen" : "Folder", 22);
+  folderIcon.innerHTML = icon(contactId === state.snapshot.activeContactId ? "FolderOpen" : "Folder", 22);
   const copy = document.createElement("span");
   copy.className = "project-folder-copy";
   const name = document.createElement("strong");
   name.textContent = folder.name;
   const path = document.createElement("span");
-  path.textContent = folder.path;
+  path.textContent = aiState === "idle" ? folder.path : AI_ACTIVITY_STATE_TEXT[aiState];
   copy.append(name, path);
   button.append(folderIcon, copy);
   button.addEventListener("click", (event) => {
@@ -1984,7 +1305,20 @@ function renderProjectFolders(): void {
   createButton.setAttribute("aria-label", "新建项目目录");
   createButton.innerHTML = icon("Plus", 14);
   createButton.addEventListener("click", () => openProjectDirectoryDialog());
-  toolbar.append(toolbarLabel, toolbarCount, createButton);
+  toolbar.append(toolbarLabel, toolbarCount);
+  if (isTauriRuntime()) {
+    const editStoreButton = document.createElement("button");
+    editStoreButton.type = "button";
+    editStoreButton.id = "edit-project-store";
+    editStoreButton.title = projectStorePathLabel
+      ? `在外部编辑项目数据（${projectStorePathLabel}），保存后自动生效`
+      : "在外部编辑项目数据，保存后自动生效";
+    editStoreButton.setAttribute("aria-label", "在外部编辑项目数据");
+    editStoreButton.innerHTML = icon("FilePen", 14);
+    editStoreButton.addEventListener("click", () => void openProjectStoreForEditing());
+    toolbar.append(editStoreButton);
+  }
+  toolbar.append(createButton);
   contactList.append(toolbar);
 
   const normalized = filterText.trim().toLocaleLowerCase();
@@ -2122,6 +1456,7 @@ function renderChatHeader(): void {
   const contact = getActiveContact();
   const terminalMode = isTerminalContact(contact.id);
   const projectFolder = projectFolderForContact(contact.id);
+  loadNotesForContact(contact.id);
   chatPane.classList.toggle("terminal-mode", terminalMode);
   terminalHost.hidden = !terminalMode;
   transcript.hidden = terminalMode;
@@ -2250,7 +1585,7 @@ function updateTypingStatus(): void {
       : `${label} · 未连接`;
     status.classList.add("terminal-active");
     status.classList.remove("active");
-  } else if (typingContactId === snapshot.activeContactId) {
+  } else if (typingContactId === state.snapshot.activeContactId) {
     status.textContent = `${getActiveContact().displayName} 正在输入...`;
     status.classList.add("active");
     status.classList.remove("terminal-active");
@@ -2282,9 +1617,9 @@ function updateSendState(): void {
 }
 
 function replaceContact(updated: Contact): void {
-  const index = snapshot.contacts.findIndex((contact) => contact.id === updated.id);
-  if (index >= 0) snapshot.contacts[index] = updated;
-  if (updated.id === snapshot.currentUser.id) snapshot.currentUser = updated;
+  const index = state.snapshot.contacts.findIndex((contact) => contact.id === updated.id);
+  if (index >= 0) state.snapshot.contacts[index] = updated;
+  if (updated.id === state.snapshot.currentUser.id) state.snapshot.currentUser = updated;
 }
 
 function projectDirectoryHeader(directoryId: string): HTMLElement | null {
@@ -2411,8 +1746,8 @@ async function selectProjectFolder(projectId: string): Promise<void> {
     return;
   }
   const contactId = projectContactId(projectId);
-  if (!snapshot.contacts.some((contact) => contact.id === contactId)) {
-    snapshot.contacts.push(projectFolderContact(folder));
+  if (!state.snapshot.contacts.some((contact) => contact.id === contactId)) {
+    state.snapshot.contacts.push(projectFolderContact(folder));
   }
   await selectContact(contactId, selectionSequence);
 }
@@ -2423,6 +1758,15 @@ async function openProjectFolderInOneCommander(folder: ProjectFolder): Promise<v
     showToast(`已在 OneCommander 中打开“${folder.name}”`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : "无法使用 OneCommander 打开项目文件夹");
+  }
+}
+
+async function openProjectStoreForEditing(): Promise<void> {
+  try {
+    await backend.openProjectStoreFile();
+    showToast("已打开项目数据文件，保存后界面会自动更新");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "无法打开项目数据文件");
   }
 }
 
@@ -2558,7 +1902,7 @@ function renameProjectFolder(): void {
       item.id === projectId ? { ...item, name } : item
     )));
     const contactId = projectContactId(projectId);
-    const active = snapshot.activeContactId === contactId;
+    const active = state.snapshot.activeContactId === contactId;
     closeProjectRenameDialog(false);
     syncProjectFolderContacts();
     renderContacts();
@@ -2612,8 +1956,8 @@ async function confirmProjectRemoval(): Promise<void> {
   }
   closeProjectRemovalDialog(false);
 
-  if (snapshot.activeContactId === contactId) {
-    const fallback = snapshot.contacts.find((contact) => !isProjectContact(contact.id));
+  if (state.snapshot.activeContactId === contactId) {
+    const fallback = state.snapshot.contacts.find((contact) => !isProjectContact(contact.id));
     if (fallback) await selectContact(fallback.id);
   }
   await disposeTerminalWorkspace(contactId);
@@ -2626,9 +1970,9 @@ async function confirmProjectRemoval(): Promise<void> {
   showToast(`已从群组移除“${folder.name}”`);
 }
 
-function openRenameTerminal(contactId = snapshot.activeContactId): void {
+function openRenameTerminal(contactId = state.snapshot.activeContactId): void {
   if (!isTerminalContact(contactId) || isProjectContact(contactId)) return;
-  const contact = snapshot.contacts.find((item) => item.id === contactId);
+  const contact = state.snapshot.contacts.find((item) => item.id === contactId);
   if (!contact) return;
   renamingTerminalId = contactId;
   terminalNameInput.value = contact.displayName;
@@ -2670,7 +2014,7 @@ async function renameTerminal(): Promise<void> {
     replaceContact(updated);
     closeRenameTerminal(false);
     renderContacts();
-    if (snapshot.activeContactId === contactId) {
+    if (state.snapshot.activeContactId === contactId) {
       renderChatHeader();
       updateTerminalConnectionStatus();
       query<HTMLButtonElement>("#terminal-rename").focus();
@@ -2685,8 +2029,8 @@ async function renameTerminal(): Promise<void> {
 async function addTerminalContact(): Promise<void> {
   try {
     const contact = await backend.createTerminalContact();
-    if (!snapshot.contacts.some((item) => item.id === contact.id)) {
-      snapshot.contacts.push(contact);
+    if (!state.snapshot.contacts.some((item) => item.id === contact.id)) {
+      state.snapshot.contacts.push(contact);
     }
     filterText = "";
     query<HTMLInputElement>("#contact-search").value = "";
@@ -2704,14 +2048,14 @@ async function selectContact(
   selectionSequence = ++contactSelectionSequence,
 ): Promise<void> {
   if (selectionSequence !== contactSelectionSequence) return;
-  if (contactId === snapshot.activeContactId && shell.classList.contains("show-chat")) {
+  if (contactId === state.snapshot.activeContactId && shell.classList.contains("show-chat")) {
     if (isTerminalContact(contactId)) {
       ensureTerminal();
     }
     return;
   }
-  messageDrafts.set(snapshot.activeContactId, messageInput.value);
-  snapshot.activeContactId = contactId;
+  messageDrafts.set(state.snapshot.activeContactId, messageInput.value);
+  state.snapshot.activeContactId = contactId;
   messageInput.value = messageDrafts.get(contactId) ?? "";
   messageInputComposing = false;
   shell.classList.add("show-chat");
@@ -2760,13 +2104,13 @@ async function scheduleReply(contactId: string): Promise<void> {
 
   try {
     const reply = await backend.generateReply(contactId);
-    const contact = snapshot.contacts.find((item) => item.id === contactId);
+    const contact = state.snapshot.contacts.find((item) => item.id === contactId);
     if (contact) {
       contact.lastMessage = reply.text;
       contact.lastMessageAt = reply.sentAt;
-      if (contactId !== snapshot.activeContactId) contact.unreadCount += 1;
+      if (contactId !== state.snapshot.activeContactId) contact.unreadCount += 1;
     }
-    if (contactId === snapshot.activeContactId) {
+    if (contactId === state.snapshot.activeContactId) {
       messages.push(reply);
       renderMessages();
     }
@@ -2792,7 +2136,7 @@ function terminalSubmissionBytes(value: string, pane: TerminalPaneRuntime): Uint
 }
 
 async function sendCurrentMessage(overrideText?: string): Promise<void> {
-  const contactId = snapshot.activeContactId;
+  const contactId = state.snapshot.activeContactId;
   const rawText = overrideText ?? messageInput.value;
   const text = isTerminalContact(contactId) ? rawText : rawText.trim();
   if (!text.trim()) return;
@@ -2850,6 +2194,66 @@ function setTab(tab: RosterTab): void {
   renderContacts();
 }
 
+const rosterTabShortcuts: readonly RosterTab[] = ["friends", "groups", "recent"];
+
+function anyModalDialogOpen(): boolean {
+  return [
+    terminalRenameDialog,
+    projectDirectoryDialog,
+    projectFolderDialog,
+    projectRenameDialog,
+    projectRemoveDialog,
+    aboutDialog,
+    avatarDialog,
+  ].some((dialog) => !dialog.hidden);
+}
+
+function rosterShortcutRows(): HTMLButtonElement[] {
+  return [...contactList.querySelectorAll<HTMLButtonElement>(
+    ".contact-row, .project-folder-row",
+  )];
+}
+
+// Alt+↑/↓ 在列表内上下移动（好友、群组/项目文件夹、最近均可用），
+// 从终端或聊天输入框触发时，以当前选中项为锚点开始移动。
+function moveRosterSelection(step: 1 | -1): void {
+  const rows = rosterShortcutRows();
+  if (rows.length === 0) return;
+  if (rosterCollapsed) applyRosterCollapsed(false);
+  const focused = rows.indexOf(document.activeElement as HTMLButtonElement);
+  let index: number;
+  if (focused !== -1) {
+    index = (focused + step + rows.length) % rows.length;
+  } else {
+    const selected = rows.findIndex((row) => row.classList.contains("selected"));
+    index = selected === -1
+      ? (step === 1 ? 0 : rows.length - 1)
+      : (selected + step + rows.length) % rows.length;
+  }
+  const target = rows[index];
+  target.focus();
+  target.scrollIntoView({ block: "nearest" });
+}
+
+// 全局快捷键：Alt+1/2/3 切换 好友/群组/最近；Alt+↑/↓ 移动列表选中。
+// 注册在捕获阶段，确保终端（xterm）聚焦时也能生效。
+function handleGlobalRosterShortcut(event: KeyboardEvent): void {
+  if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if (event.isComposing || anyModalDialogOpen()) return;
+  if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    moveRosterSelection(event.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
+  const tabIndex = ["1", "2", "3"].indexOf(event.key);
+  if (tabIndex !== -1) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    setTab(rosterTabShortcuts[tabIndex]);
+  }
+}
+
 function insertAtCursor(text: string): void {
   const start = messageInput.selectionStart;
   const end = messageInput.selectionEnd;
@@ -2861,7 +2265,7 @@ function insertAtCursor(text: string): void {
 async function setUserPresence(presence: Presence): Promise<void> {
   try {
     const user = await backend.setPresence(presence);
-    snapshot.currentUser = user;
+    state.snapshot.currentUser = user;
     updateProfile();
     popupMenu.hidden = true;
   } catch (error) {
@@ -3036,6 +2440,10 @@ function bindEvents(): void {
   query("#minimize-window").addEventListener("click", () => void windowAction("minimize"));
   query("#maximize-window").addEventListener("click", () => void windowAction("maximize"));
   query("#close-window").addEventListener("click", () => void windowAction("close"));
+  query("#roster-collapse-toggle").addEventListener("click", toggleRosterCollapsed);
+  query("#roster-pane").addEventListener("click", () => {
+    if (rosterCollapsed) applyRosterCollapsed(false);
+  });
 
   query<HTMLInputElement>("#contact-search").addEventListener("input", (event) => {
     filterText = (event.currentTarget as HTMLInputElement).value;
@@ -3087,8 +2495,8 @@ function bindEvents(): void {
     }, 0);
   });
   messageInput.addEventListener("input", () => {
-    if (snapshot?.activeContactId) {
-      messageDrafts.set(snapshot.activeContactId, messageInput.value);
+    if (state.snapshot?.activeContactId) {
+      messageDrafts.set(state.snapshot.activeContactId, messageInput.value);
     }
     updateSendState();
   });
@@ -3126,6 +2534,7 @@ function bindEvents(): void {
     pane?.terminal.focus();
   });
   query("#terminal-restart").addEventListener("click", () => void restartTerminal());
+  query("#terminal-new-chat").addEventListener("click", () => void startNewPiDialog());
   query("#terminal-split-left-right").addEventListener("click", () => {
     void splitActiveTerminal("left-right");
   });
@@ -3149,6 +2558,9 @@ function bindEvents(): void {
     rows[(index + change + rows.length) % rows.length]?.focus();
     event.preventDefault();
   });
+
+  // 捕获阶段注册，保证终端/输入框聚焦时 Alt+↑/↓、Alt+1/2/3 依然生效
+  document.addEventListener("keydown", handleGlobalRosterShortcut, { capture: true });
 
   document.querySelectorAll<HTMLButtonElement>(".menu-trigger").forEach((button) => {
     button.addEventListener("click", () => {
@@ -3255,6 +2667,11 @@ function bindEvents(): void {
   });
   document.addEventListener("keydown", (event) => {
     if (event.ctrlKey && !event.altKey) {
+      if (event.key === "b" || event.key === "B") {
+        event.preventDefault();
+        toggleRosterCollapsed();
+        return;
+      }
       if (event.key === "0") {
         event.preventDefault();
         void applyPageZoom(1);
@@ -3284,10 +2701,55 @@ function bindEvents(): void {
   });
 }
 
+function cacheProjectFolderResolution(
+  workspace: TerminalWorkspace,
+  location: ProjectFolderLocation,
+): void {
+  const folder = workspace.projectFolder;
+  const cache = projectLaunchCache(location);
+  if (!folder || !cache) return;
+  const current = projectFolders.find((item) => item.id === folder.id);
+  if (!current) return;
+
+  const updated: ProjectFolder = {
+    ...current,
+    path: location.path,
+    ...cache,
+  };
+  try {
+    saveProjectFolders(projectFolders.map((item) => item.id === updated.id ? updated : item));
+  } catch {
+    return;
+  }
+  workspace.projectFolder = updated;
+  syncProjectFolderContacts();
+  renderContacts();
+  if (state.snapshot.activeContactId === workspace.contactId) renderChatHeader();
+}
+
+// 终端/恢复子系统的 main 侧依赖注入 + 看门狗心跳安装。
+setTerminalHooks({
+  cacheProjectFolderResolution,
+  projectFolderPath: (projectId) => projectFolders.find((folder) => folder.id === projectId)?.path,
+  projectFolderForContact,
+  getActiveContactName: () => getActiveContact().displayName,
+  updateTypingStatus,
+  updateSendState,
+});
+setRecoveryHooks({ selectContact });
+installWatchdogPing();
+
 async function start(): Promise<void> {
   refreshIcons();
   bindEvents();
+  if (isTauriRuntime()) {
+    void listen(PROJECT_STORE_CHANGED_EVENT, () => {
+      void handleProjectStoreChange();
+    });
+  }
   await applyPageZoom(currentZoom, false);
+  applyRosterCollapsed(rosterCollapsed);
+  initNotesPane();
   void syncWindowState();
   if (isTauriRuntime()) {
     const appWindow = getCurrentWindow();
@@ -3303,10 +2765,11 @@ async function start(): Promise<void> {
   updateClock();
   window.setInterval(updateClock, 1000);
   try {
-    snapshot = await backend.bootstrap();
+    state.snapshot = await backend.bootstrap();
+    await initProjectStore();
     syncProjectFolderContacts();
-    messages = snapshot.messages.filter(
-      (message) => message.contactId === snapshot.activeContactId,
+    messages = state.snapshot.messages.filter(
+      (message) => message.contactId === state.snapshot.activeContactId,
     );
     updateProfile();
     renderContacts();
@@ -3318,10 +2781,17 @@ async function start(): Promise<void> {
     refreshIcons();
     if (isTerminalContact()) activeTerminalPane()?.terminal.focus();
     else messageInput.focus();
+    void window.setTimeout(() => void maybeRecoverDialogs(), 600);
   } catch (error) {
     query("#connection-status").textContent = "连接失败";
     showToast(error instanceof Error ? error.message : "应用初始化失败");
   }
+}
+
+if (isTauriRuntime()) {
+  void listen("webview-recovered", () => {
+    showToast("WebView 运行时已崩溃，窗口已自动恢复");
+  }).catch(() => undefined);
 }
 
 void start();

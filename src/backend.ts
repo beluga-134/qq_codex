@@ -6,6 +6,7 @@ import {
   type Contact,
   type Message,
   type Presence,
+  type ProjectDirectory,
   type ProjectFolder,
   type ProjectFolderLocation,
   type TerminalExecution,
@@ -23,7 +24,33 @@ export interface PtyOpenResult {
   project: ProjectFolderLocation | null;
 }
 
+export interface ResumePanelRecord {
+  contactId: string;
+  paneId: number;
+  projectPath: string;
+  projectWslPath: string | null;
+  sessionId: string;
+  sessionName: string;
+  openedAt: string;
+}
+
+export interface ResumeDialogInfo {
+  sessionId: string;
+  sessionName: string;
+}
+
+export interface ResumeStatus {
+  crashed: boolean;
+  fatalLoop: boolean;
+  panels: ResumePanelRecord[];
+}
+
 export type PtyData = ArrayBuffer | Uint8Array | number[];
+
+export interface ProjectStore {
+  directories: ProjectDirectory[];
+  folders: ProjectFolder[];
+}
 
 const now = Date.now();
 
@@ -448,6 +475,47 @@ function mockTerminalExecution(
 }
 
 export const backend = {
+  // Webview 看门狗心跳回执：仅 Tauri 运行时需要，失败静默（看门狗靠连续缺失判死）。
+  async watchdogPong(): Promise<void> {
+    if (isTauri()) await invoke("watchdog_pong");
+  },
+
+  // pi 会话恢复：注册/注销对话窗格、崩溃状态查询、恢复完成确认、PTY 清场。
+  async resumeDialogOpen(
+    contactId: string,
+    paneId: number,
+    projectPath: string,
+    projectWslPath: string | null,
+  ): Promise<ResumeDialogInfo> {
+    if (isTauri()) {
+      return invoke<ResumeDialogInfo>("resume_dialog_open", {
+        contactId,
+        paneId,
+        projectPath,
+        projectWslPath,
+      });
+    }
+    throw new Error("仅 Tauri 运行时支持会话恢复");
+  },
+
+  async resumeDialogClose(contactId: string, paneId: number | null): Promise<void> {
+    if (isTauri()) await invoke("resume_dialog_close", { contactId, paneId });
+  },
+
+  async resumeStatus(): Promise<ResumeStatus | null> {
+    if (!isTauri()) return null;
+    return invoke<ResumeStatus>("resume_status");
+  },
+
+  async resumeMarkRecovered(): Promise<void> {
+    if (isTauri()) await invoke("resume_mark_recovered");
+  },
+
+  async ptyCloseAll(): Promise<number> {
+    if (isTauri()) return invoke<number>("pty_close_all");
+    return 0;
+  },
+
   async bootstrap(): Promise<AppSnapshot> {
     if (isTauri()) return invoke<AppSnapshot>("bootstrap");
     return clone({
@@ -567,6 +635,25 @@ export const backend = {
     return resolvePreviewProjectFolder(path);
   },
 
+  async projectStorePath(): Promise<string> {
+    if (isTauri()) return invoke<string>("project_store_path");
+    throw new Error("浏览器预览没有外部项目数据文件");
+  },
+
+  async readProjectStore(): Promise<ProjectStore | null> {
+    if (isTauri()) return invoke<ProjectStore | null>("read_project_store");
+    return null;
+  },
+
+  async writeProjectStore(store: ProjectStore): Promise<void> {
+    if (isTauri()) await invoke<void>("write_project_store", { store });
+  },
+
+  async openProjectStoreFile(): Promise<void> {
+    if (isTauri()) await invoke<void>("open_project_store_file");
+    else throw new Error("浏览器预览不支持打开项目数据文件");
+  },
+
   async openProjectFolderInOneCommander(folder: ProjectFolder): Promise<void> {
     if (!isTauri()) throw new Error("仅 Windows 桌面版支持使用 OneCommander 打开项目文件夹");
     await invoke<void>("open_project_folder_in_onecommander", {
@@ -614,6 +701,48 @@ export const backend = {
       sessionId,
       data: Array.from(data),
     });
+  },
+
+  async saveTerminalImage(bytes: Uint8Array, fileName: string): Promise<string> {
+    if (!isTauri() || bytes.length === 0) return "";
+    return invoke<string>("save_terminal_image", {
+      bytes: Array.from(bytes),
+      fileName,
+    });
+  },
+
+  /** 读取终端图片文件，返回 data: URL（悬浮预览/大图查看用） */
+  async readTerminalImage(path: string): Promise<string> {
+    if (!isTauri()) throw new Error("仅桌面版支持查看终端图片");
+    return invoke<string>("read_terminal_image", { path });
+  },
+
+  /** 读取终端图片文件信息（mtime/size），悬浮缓存失效判定用 */
+  async statTerminalImage(path: string): Promise<{ mtimeMs: number; size: number }> {
+    if (!isTauri()) throw new Error("仅桌面版支持查看终端图片");
+    return invoke<{ mtimeMs: number; size: number }>("stat_terminal_image", { path });
+  },
+
+  /** 把终端图片保存到宿主图片文件夹，返回保存路径 */
+  async exportTerminalImage(path: string): Promise<string> {
+    if (!isTauri()) throw new Error("仅桌面版支持保存终端图片");
+    return invoke<string>("export_terminal_image", { path });
+  },
+
+  /** 用系统默认程序打开终端里输出的文件路径，返回实际打开的宿主路径 */
+  async openTerminalFile(path: string): Promise<string> {
+    if (!isTauri()) throw new Error("仅桌面版支持打开文件");
+    return invoke<string>("open_terminal_file", { path });
+  },
+
+  /** 读取全部便签（exe 同目录 notes.json；联系人 id → 文本） */
+  async readNotes(): Promise<Record<string, string>> {
+    return invoke<Record<string, string>>("read_notes");
+  },
+
+  /** 全量写回便签（原子替换） */
+  async writeNotes(notes: Record<string, string>): Promise<void> {
+    return invoke<void>("write_notes", { notes });
   },
 
   async resizePty(sessionId: number, rows: number, cols: number): Promise<void> {
