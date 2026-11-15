@@ -361,17 +361,3 @@ pub(crate) fn pty_close(session_id: u64, state: State<'_, PtyState>) -> Result<(
         .kill()
         .map_err(|error| format!("关闭终端失败：{error}"))
 }
-
-/// 杀掉全部 PTY 会话（崩溃恢复前清场，防旧 pi 进程与新会话双写同一 jsonl）。
-#[tauri::command]
-pub(crate) fn pty_close_all(state: State<'_, PtyState>) -> Result<u32, String> {
-    let mut sessions = state
-        .sessions
-        .lock()
-        .map_err(|_| "终端状态锁不可用".to_string())?;
-    let killed = sessions.len() as u32;
-    for (_, mut session) in sessions.drain() {
-        let _ = session.killer.kill();
-    }
-    Ok(killed)
-}

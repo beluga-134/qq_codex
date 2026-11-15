@@ -6,11 +6,9 @@ mod chat;
 mod notes;
 mod projects;
 mod pty;
-mod resume;
 mod terminal_exec;
 mod terminal_files;
 mod types;
-mod watchdog;
 
 use chat::{
     bootstrap, create_terminal_contact, execute_terminal, generate_reply, get_conversation,
@@ -36,9 +34,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             applog::init(app.handle());
-            resume::init(app.handle());
             spawn_project_store_watcher(app.handle().clone());
-            watchdog::spawn(app.handle().clone());
 
             #[cfg(target_os = "linux")]
             {
@@ -89,20 +85,10 @@ pub fn run() {
             write_notes,
             mark_read,
             set_presence,
-            watchdog::watchdog_pong,
-            pty::pty_close_all,
-            resume::resume_dialog_open,
-            resume::resume_dialog_close,
-            resume::resume_status,
-            resume::resume_mark_recovered
         ])
         .build(tauri::generate_context!())
         .expect("error while building Retro Messenger")
-        .run(|_app, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
-                resume::heartbeat_remove();
-            }
-        });
+        .run(|_app, _event| {});
 }
 
 #[cfg(test)]

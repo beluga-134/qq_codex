@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$ToolingRoot = Join-Path $ProjectRoot '.tooling'
+$ToolingRoot = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot '..\.tooling'))
 $WindowsToolingRoot = Join-Path $ToolingRoot 'windows'
 $CacheRoot = Join-Path $ProjectRoot '.cache'
 $WindowsCacheRoot = Join-Path $CacheRoot 'windows'
@@ -20,7 +20,8 @@ $CargoHome = Join-Path $WindowsToolingRoot 'cargo'
 $RustupHome = Join-Path $WindowsToolingRoot 'rustup'
 $PortableGitRoot = Join-Path $WindowsToolingRoot 'portable-git'
 $NpmPrefix = Join-Path $WindowsToolingRoot 'npm-global'
-$VsBuildToolsRoot = Join-Path $WindowsToolingRoot 'vs-build-tools'
+# vs-build-tools 文件被 ACL 锁死无法搬迁，留在项目内（路径由 $PSScriptRoot 推导，项目改名自动跟随）
+$VsBuildToolsRoot = Join-Path $ProjectRoot '.tooling\windows\vs-build-tools'
 
 $NpmCache = Join-Path $WindowsCacheRoot 'npm'
 $CargoTargetDir = Join-Path $WindowsCacheRoot 'cargo-target'

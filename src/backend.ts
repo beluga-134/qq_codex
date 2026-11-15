@@ -24,26 +24,8 @@ export interface PtyOpenResult {
   project: ProjectFolderLocation | null;
 }
 
-export interface ResumePanelRecord {
-  contactId: string;
-  paneId: number;
-  projectPath: string;
-  projectWslPath: string | null;
-  sessionId: string;
-  sessionName: string;
-  openedAt: string;
-}
 
-export interface ResumeDialogInfo {
-  sessionId: string;
-  sessionName: string;
-}
 
-export interface ResumeStatus {
-  crashed: boolean;
-  fatalLoop: boolean;
-  panels: ResumePanelRecord[];
-}
 
 export type PtyData = ArrayBuffer | Uint8Array | number[];
 
@@ -475,47 +457,6 @@ function mockTerminalExecution(
 }
 
 export const backend = {
-  // Webview 看门狗心跳回执：仅 Tauri 运行时需要，失败静默（看门狗靠连续缺失判死）。
-  async watchdogPong(): Promise<void> {
-    if (isTauri()) await invoke("watchdog_pong");
-  },
-
-  // pi 会话恢复：注册/注销对话窗格、崩溃状态查询、恢复完成确认、PTY 清场。
-  async resumeDialogOpen(
-    contactId: string,
-    paneId: number,
-    projectPath: string,
-    projectWslPath: string | null,
-  ): Promise<ResumeDialogInfo> {
-    if (isTauri()) {
-      return invoke<ResumeDialogInfo>("resume_dialog_open", {
-        contactId,
-        paneId,
-        projectPath,
-        projectWslPath,
-      });
-    }
-    throw new Error("仅 Tauri 运行时支持会话恢复");
-  },
-
-  async resumeDialogClose(contactId: string, paneId: number | null): Promise<void> {
-    if (isTauri()) await invoke("resume_dialog_close", { contactId, paneId });
-  },
-
-  async resumeStatus(): Promise<ResumeStatus | null> {
-    if (!isTauri()) return null;
-    return invoke<ResumeStatus>("resume_status");
-  },
-
-  async resumeMarkRecovered(): Promise<void> {
-    if (isTauri()) await invoke("resume_mark_recovered");
-  },
-
-  async ptyCloseAll(): Promise<number> {
-    if (isTauri()) return invoke<number>("pty_close_all");
-    return 0;
-  },
-
   async bootstrap(): Promise<AppSnapshot> {
     if (isTauri()) return invoke<AppSnapshot>("bootstrap");
     return clone({

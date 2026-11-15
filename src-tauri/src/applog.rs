@@ -1,8 +1,7 @@
-//! 应用日志与 panic 兜底：exe 旁 `logs/` 目录（不可写时回退 %LOCALAPPDATA%）。
-//!
-//! - `recovery.log`：看门狗、崩溃检测、会话恢复等关键事件流水（append）。
-//! - `panic.log`：Rust panic 兜底。release 构建 `windows_subsystem = "windows"`
-//!   无控制台，stderr 无人接收，这里是崩溃排查的唯一线索。
+//! panic 兜底日志：exe 旁 `logs/panic.log`（不可写时回退 %LOCALAPPDATA%）。
+//! release 构建 `windows_subsystem = "windows"` 无控制台，stderr 无人接收，
+//! panic.log 是崩溃排查的唯一线索。（事件流水 recovery.log 已随看护/恢复
+//! 逻辑移除，2026-11-14。）
 //!
 //! 时间统一用本地时区固定 UTC+8 格式化（无 chrono 依赖的手写换算）。
 
@@ -24,14 +23,6 @@ pub(crate) fn init(_app: &AppHandle) {
     install_panic_hook(&logs);
 }
 
-/// exe 所在目录（fallback %LOCALAPPDATA%\com.retro.messenger）。
-pub(crate) fn base_dir() -> PathBuf {
-    BASE_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 fn resolve_base_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
@@ -50,19 +41,6 @@ fn resolve_base_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."));
     let _ = std::fs::create_dir_all(fallback.join("logs"));
     fallback
-}
-
-/// 追加一条事件到 `logs/recovery.log`。
-pub(crate) fn event(category: &str, msg: &str) {
-    let Some(base) = BASE_DIR.get() else { return };
-    let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(base.join("logs").join("recovery.log"))
-    else {
-        return;
-    };
-    let _ = writeln!(file, "[{}] [{}] {}", now_string(), category, msg);
 }
 
 fn install_panic_hook(logs: &PathBuf) {
@@ -105,21 +83,6 @@ pub(crate) fn now_epoch() -> u64 {
 pub(crate) fn now_string() -> String {
     let (date, hms) = split_local(now_epoch());
     format!("{date} {hms}")
-}
-
-/// `2026-11-09`（UTC+8）。
-pub(crate) fn now_date() -> String {
-    split_local(now_epoch()).0
-}
-
-/// `20261109`（UTC+8）。
-pub(crate) fn now_ymd8() -> String {
-    split_local(now_epoch()).0.replace('-', "")
-}
-
-/// `223301`（UTC+8，时分秒紧凑）。
-pub(crate) fn now_hms_compact() -> String {
-    split_local(now_epoch()).1.replace(':', "")
 }
 
 fn split_local(epoch: u64) -> (String, String) {

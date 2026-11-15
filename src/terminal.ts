@@ -83,6 +83,7 @@ export interface TerminalPaneRuntime {
   aiLastOutputAt: number;
   aiQuietTimer: number | null;
   aiDoneTimer: number | null;
+
 }
 
 export interface TerminalWorkspace {
@@ -405,7 +406,7 @@ const IMAGE_PATH_REGEX =
  * 排除图片（图片走悬浮预览/大图）；扩展名后须是空白/行尾，避免路径中
  * 间目录带点（/a/b.c/d）或 yml:3:5 位置后缀被截成半截路径 */
 const FILE_PATH_REGEX =
-  /(?:\\[^\s"'<>|]+|[A-Za-z]:\\[^\s"'<>|]+|\/[^\s"'<>|]+)\.(?!png|jpe?g|gif|webp|bmp)[A-Za-z0-9]{1,8}(?=[\s]|$)/gi;
+  /(?:\\[^\s"'<>|]+|[A-Za-z]:\\[^\s"'<>|]+|\/[^\s"'<>|]+)\.(?!png|jpe?g|gif|webp|bmp)[A-Za-z0-9]{1,8}(?=[\s"'!,.;?*_`~<>()（）\[\]【】《》""''…,，。、；：？！]|$)/gi;
 /** 路径 → data: URL 缓存：带 mtime/size 失效判定，同名文件重绘后悬浮自动刷新 */
 interface CachedTerminalImage {
   url: string;
@@ -1650,7 +1651,6 @@ export async function disposeTerminalPane(
 export async function disposeTerminalWorkspace(contactId: string): Promise<void> {
   const workspace = terminalWorkspaces.get(contactId);
   if (!workspace) return;
-  void backend.resumeDialogClose(contactId, null).catch(() => undefined);
   if (workspace.fitFrame !== null) cancelAnimationFrame(workspace.fitFrame);
   workspace.fitFrame = null;
   const panes = [...workspace.panes.values()];
@@ -1676,7 +1676,6 @@ export async function closeTerminalPane(pane: TerminalPaneRuntime): Promise<void
     workspace.activePaneId =
       remainingIds[Math.min(Math.max(previousIndex, 0), remainingIds.length - 1)] ?? null;
   }
-  void backend.resumeDialogClose(workspace.contactId, pane.id).catch(() => undefined);
   renderTerminalLayout(workspace);
   await disposeTerminalPane(pane, true);
   const active = activeTerminalPane(workspace);

@@ -9,6 +9,11 @@ edition = "2021"
 name = "retro_messenger_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# 生产构建必须启用（tauri build 会传 --features custom-protocol）：
+# 启用后 generate_context! 才会用 frontendDist 内嵌资产，否则连 devUrl。
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
